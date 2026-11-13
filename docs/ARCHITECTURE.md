@@ -833,9 +833,26 @@ reproduction runs twice at most, in its own throwaway copy of the head
 worktree, after a probe through the same wrapper has shown that the network, a
 write outside the copy and its scratch directory, an overwrite of the runner's
 own files and a read of the run directory are refused. On Linux the wrapper is
-`unshare` with user, mount, network and pid namespaces and a read-only root; on
-macOS nothing runs until issue #321; elsewhere there is no mechanism and
-nothing runs. The environment is an allowlist, never the reviewer's, and CPU,
+`unshare` with user, mount, network and pid namespaces and a read-only root.
+On macOS nothing runs. The sandbox there is reported unavailable, without a
+probe, until each run executes under an identity or environment of its own,
+which would also close the two System V IPC limits the threat model states
+(issue #321, docs/adr/0003). What macOS would use is in place and tested
+behind that one check. Its wrapper is `sandbox-exec` with a profile that
+denies everything it does not allow, and the probe there also shows that a
+signal, a preference write and a notification are refused (a listener outside the sandbox must print a key the
+CLI posts before the probe, which shows it hears, and then, only after the CLI
+posts it once the probe is back, a second key, with the probe's key not
+printed, and the state the probe sets on its key, read from outside while the
+listener still holds it, must be unset, or the probe fails; the verdict is
+taken only after that read, so a line printed during it counts, and the probe
+fails as unable to test notifications unless its own attempt started and
+exited 0, as a refused one does). On macOS each run is also bracketed by
+listings of the user's System V IPC objects, which the profile cannot deny:
+one that appears during the run is left in place, since another program of
+the user may own it, and the run is `did-not-run` with a reason listing each
+object's type and id, as it is when a listing fails. Elsewhere there is
+no mechanism and nothing runs. The environment is an allowlist, never the reviewer's, and CPU,
 memory, file-size and wall-clock limits apply. A run counts only when it printed
 `RV_REPRO_REACHED <candidate id>` before its assertion. Two failing runs are
 `reproduced`, a pass on either run is `did-not-fail`, and anything else,
@@ -1076,7 +1093,18 @@ shipping the false one. It is unstable at the boundary too: the same finding on
 an identical diff scored 0.75 and then 0.80, which decided whether it reached
 the author.
 
-A verifier-established confidence is still held at 0.8. An analyst-only one is
+A verifier-established confidence is still held at 0.8
+(`review.confidence_threshold`) for a finding whose derived tier is `blocking`
+or `important`, and at 0.7 (`review.minor_confidence_threshold`, never above the
+first) for one at `minor` or `nit` (#343). Half the recall misses were verified
+findings held under 0.8, nearly all minors and nits, which cost the author least
+to decline. A
+finding in a category no suppression may reach (security, authorization,
+authentication, data integrity, trust boundary) takes the main floor at every
+tier, so a tier derived too low cannot also lower its bar. The rejection names
+the floor that applied, and so does the `threshold` of its `belowGate` entry
+([ADR 0016](adr/0016-what-the-verifier-could-not-check.md), amended
+2026-11-12). An analyst-only one is
 held at 0.7, which is where the labelled data puts it: below that the signal
 does carry, since candidates at 0.50 and 0.65 were weak or wrong, and above it
 the number is noise. `score` reports how many candidates were gated on the
