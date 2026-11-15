@@ -44,7 +44,8 @@ The fix sentence is present only when `fix.render` is not `none`.
 - `fix`: state `fix.text`, shortened if needed without changing what it
   changes.
 - `direction`: state `fix.text` as the direction it is.
-- `none`: stop after the consequence. There is no fix text to state.
+- `none`: stop after the consequence. There is no fix text to state. `withheld`
+  says why, for the person reading the scores; never state it.
 
 A finding with `impactDisputed: true` had its reach contested: a second
 verifier disputed how far the failure goes, and no tie-break upheld the wider
@@ -69,6 +70,14 @@ a number.
 A `nit` is a genuine observation the author may reasonably decline. Say it
 plainly and let the tier carry the low stakes; do not soften the wording on top
 of the label.
+
+An entry with `alsoAt` lists further places where the verifier confirmed the
+same defect. After the consequence, name them as `Also at <path:line>, ...`,
+as they are written; do not describe them.
+
+An entry with `challengeAnswer` was raised as a question and the challenger
+settled it from the code. Its severity is `minor`. State it as a defect, from
+`challengeAnswer` and the failure mode, and do not word it as a question.
 
 A `question` asks something the diff cannot answer. Same shape: what you are
 asking, and why it matters. Do not ask a question you could have verified.

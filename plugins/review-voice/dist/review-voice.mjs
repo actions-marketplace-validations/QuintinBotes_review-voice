@@ -805,11 +805,23 @@ function acquireDiff(options) {
     const path = match[1];
     if (path !== void 0 && path !== "/dev/null") hunkPaths.add(path);
   }
+  const head = git(["rev-parse", "HEAD"], root).trim();
+  let refs;
+  if (options.base !== null) {
+    const baseSha = git(["rev-parse", `${options.base}^{commit}`], root).trim();
+    let mergeBase = null;
+    try {
+      mergeBase = git(["merge-base", baseSha, head], root).trim() || null;
+    } catch {
+    }
+    refs = { base: { sha: baseSha, available: true }, head: { sha: head, available: true }, mergeBase };
+  }
   return {
     repositoryRoot: root,
     mode,
     base: options.base,
-    head: git(["rev-parse", "HEAD"], root).trim(),
+    ...refs === void 0 ? {} : { refs },
+    head,
     files: files2,
     reviewedFileCount: reviewable.length,
     // Counted from the diff itself, not from the file list: a file can be
@@ -1480,6 +1492,8 @@ var DEFAULT_TEST_PATHS = [
   "**/fixtures/**",
   "**/__fixtures__/**",
   "**/testdata/**",
+  // The prompts and graders of an eval suite are test input, not documentation (#389).
+  "**/evals/**/*.md",
   "**/*.test.*",
   "**/*.spec.*",
   "**/*_test.go",
@@ -1511,7 +1525,11 @@ var TERNARY = / \? /g;
 var COMMENT_START = /^(?:\/\/|#|\*|\/\*|--)/;
 var HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$/;
 var DECLARATION = /^[A-Za-z_$]/;
-var STATEMENT = /^(?:if|else|elif|for|foreach|while|do|switch|case|default|try|catch|except|finally|return|break|continue|throw|when)\b/;
+var STATEMENT = /^(?:(?:if|else|elif|for|foreach|while|do|switch|case|default|try|catch|except|finally|return|break|continue|throw|when)\b|[A-Za-z_$][\w$]*=)/;
+var SHELL_DECLARATION = /^(?:function\s+[\w:.-]+|[\w:.-]+\s*\(\s*\))/;
+var SHELL_PATH = /\.(?:sh|bash|zsh|ksh)$/i;
+var SHELL_SHEBANG = /^#!.*\b(?:ba|z|k|da)?sh\b/;
+var CLOSES_DECLARATION = /^(?:\}|end\b)/;
 var MAX_SCOPE_LENGTH = 80;
 function count(text5, pattern) {
   return text5.match(pattern)?.length ?? 0;
@@ -1521,8 +1539,9 @@ function decisionPointsIn(text5) {
   if (trimmed.length === 0 || COMMENT_START.test(trimmed)) return 0;
   return count(trimmed, KEYWORDS) + count(trimmed, /&&/g) + count(trimmed, /\|\|/g) + count(trimmed, TERNARY);
 }
-function declarationIn(text5) {
-  return DECLARATION.test(text5) && !STATEMENT.test(text5) ? text5.trimEnd().slice(0, MAX_SCOPE_LENGTH) : null;
+function declarationIn(text5, shell = false) {
+  const declares = shell ? SHELL_DECLARATION.test(text5) : DECLARATION.test(text5) && !STATEMENT.test(text5);
+  return declares ? text5.trimEnd().slice(0, MAX_SCOPE_LENGTH) : null;
 }
 function headerPath2(raw) {
   const text5 = raw.replace(/\t.*$/, "");
@@ -1539,6 +1558,7 @@ function countHunks(diff, wanted) {
   let remainingOld = 0;
   let remainingNew = 0;
   let newLine = 0;
+  let shell = false;
   const record3 = (hunk, text5, removed) => {
     const decisionPoints = decisionPointsIn(text5);
     if (decisionPoints === 0) return;
@@ -1555,8 +1575,10 @@ function countHunks(diff, wanted) {
     const line3 = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     if (current !== null && (remainingOld > 0 || remainingNew > 0)) {
       const text5 = line3.slice(1);
+      if (newLine === 1 && !line3.startsWith("-") && text5.startsWith("#!")) shell = SHELL_SHEBANG.test(text5);
+      if (!line3.startsWith("-") && CLOSES_DECLARATION.test(text5)) scope = null;
       if (line3.startsWith("+")) {
-        if (declarationIn(text5) !== null) {
+        if (declarationIn(text5, shell) !== null) {
           if (!replacing) scope = null;
           replacing = false;
         }
@@ -1567,7 +1589,7 @@ function countHunks(diff, wanted) {
         continue;
       }
       if (line3.startsWith("-")) {
-        const declaration = declarationIn(text5);
+        const declaration = declarationIn(text5, shell);
         if (declaration !== null) {
           scope = declaration;
           replacing = true;
@@ -1578,7 +1600,7 @@ function countHunks(diff, wanted) {
         continue;
       }
       if (line3.startsWith(" ") || line3 === "") {
-        scope = declarationIn(text5) ?? scope;
+        scope = declarationIn(text5, shell) ?? scope;
         replacing = false;
         remainingOld -= 1;
         remainingNew -= 1;
@@ -1597,6 +1619,7 @@ function countHunks(diff, wanted) {
     }
     if (line3.startsWith("+++ ")) {
       path = headerPath2(line3.slice(4));
+      shell = path !== null && SHELL_PATH.test(path);
       continue;
     }
     const header = HUNK_HEADER.exec(line3);
@@ -1606,13 +1629,21 @@ function countHunks(diff, wanted) {
       remainingNew = header[3] === void 0 ? 1 : Number(header[3]);
       current = { path, line: Number(header[2]), decisionPoints: 0, branches: [], added: [], removed: [] };
       newLine = Number(header[2]);
-      scope = declarationIn((header[4] ?? "").trim());
+      scope = declarationIn((header[4] ?? "").trim(), shell);
       replacing = false;
       if (wanted.has(path)) hunks.push(current);
     }
   }
   finish();
   return hunks;
+}
+function declarationsOf(hunk) {
+  const units = [];
+  for (const { line: line3, text: text5 } of hunk.added) {
+    if (units.length === 0 || declarationIn(text5) !== null) units.push({ path: hunk.path, line: line3, decisionPoints: 0, declaration: true });
+    units[units.length - 1].decisionPoints += decisionPointsIn(text5);
+  }
+  return units;
 }
 function config(partial) {
   return {
@@ -1695,8 +1726,10 @@ function assessComplexity(diff, files2, partial, markedGenerated2 = /* @__PURE__
   const ofKind = (kind) => [...kinds.values()].filter((value) => value === kind).length;
   const pointsOf = (kind) => allHunks.filter((hunk) => kinds.get(hunk.path) === kind).reduce((sum, hunk) => sum + hunk.decisionPoints, 0);
   const decisionPoints = hunks.reduce((sum, hunk) => sum + hunk.decisionPoints, 0);
-  const densest = hunks.reduce(
-    (best, hunk) => hunk.decisionPoints > 0 && (best === null || hunk.decisionPoints > best.decisionPoints) ? hunk : best,
+  const added = new Set(files2.filter((file2) => file2.status === "added").map((file2) => file2.path));
+  const units = hunks.flatMap((hunk) => added.has(hunk.path) ? declarationsOf(hunk) : [hunk]);
+  const densest = units.reduce(
+    (best, unit) => unit.decisionPoints > 0 && (best === null || unit.decisionPoints > best.decisionPoints) ? unit : best,
     null
   );
   const sensitiveGlobs = [.../* @__PURE__ */ new Set([...limits.sensitivePaths, ...SENSITIVE_NEVER_EXEMPT])];
@@ -1723,7 +1756,7 @@ function assessComplexity(diff, files2, partial, markedGenerated2 = /* @__PURE__
   }
   if (densest !== null && densest.decisionPoints > limits.maxHunkDecisionPoints) {
     reasons.push(
-      `${densest.decisionPoints} decision points in one hunk at ${densest.path}:${densest.line} (limit ${limits.maxHunkDecisionPoints})`
+      `${densest.decisionPoints} decision points in one ${densest.declaration === true ? "declaration of the new file" : "hunk at"} ${densest.path}:${densest.line} (limit ${limits.maxHunkDecisionPoints})`
     );
   }
   if (sensitive.length > 0) {
@@ -5471,10 +5504,10 @@ function resolveBlockMap({ composeNode: composeNode2, composeEmptyNode: composeE
   let offset = bm.offset;
   let commentEnd = null;
   for (const collItem of bm.items) {
-    const { start, key: key2, sep: sep6, value } = collItem;
+    const { start, key: key2, sep: sep7, value } = collItem;
     const keyProps = resolveProps(start, {
       indicator: "explicit-key-ind",
-      next: key2 ?? sep6?.[0],
+      next: key2 ?? sep7?.[0],
       offset,
       onError,
       parentIndent: bm.indent,
@@ -5488,7 +5521,7 @@ function resolveBlockMap({ composeNode: composeNode2, composeEmptyNode: composeE
         else if ("indent" in key2 && key2.indent !== bm.indent)
           onError(offset, "BAD_INDENT", startColMsg);
       }
-      if (!keyProps.anchor && !keyProps.tag && !sep6) {
+      if (!keyProps.anchor && !keyProps.tag && !sep7) {
         commentEnd = keyProps.end;
         if (keyProps.comment) {
           if (map2.comment)
@@ -5512,7 +5545,7 @@ function resolveBlockMap({ composeNode: composeNode2, composeEmptyNode: composeE
     ctx.atKey = false;
     if (mapIncludes(ctx, map2.items, keyNode))
       onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-    const valueProps = resolveProps(sep6 ?? [], {
+    const valueProps = resolveProps(sep7 ?? [], {
       indicator: "map-value-ind",
       next: value,
       offset: keyNode.range[2],
@@ -5528,7 +5561,7 @@ function resolveBlockMap({ composeNode: composeNode2, composeEmptyNode: composeE
         if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
           onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
       }
-      const valueNode = value ? composeNode2(ctx, value, valueProps, onError) : composeEmptyNode2(ctx, offset, sep6, null, valueProps, onError);
+      const valueNode = value ? composeNode2(ctx, value, valueProps, onError) : composeEmptyNode2(ctx, offset, sep7, null, valueProps, onError);
       if (ctx.schema.compat)
         flowIndentCheck(bm.indent, value, onError);
       offset = valueNode.range[2];
@@ -5604,7 +5637,7 @@ function resolveEnd(end, offset, reqSpace, onError) {
   let comment = "";
   if (end) {
     let hasSpace = false;
-    let sep6 = "";
+    let sep7 = "";
     for (const token of end) {
       const { source, type } = token;
       switch (type) {
@@ -5618,13 +5651,13 @@ function resolveEnd(end, offset, reqSpace, onError) {
           if (!comment)
             comment = cb;
           else
-            comment += sep6 + cb;
-          sep6 = "";
+            comment += sep7 + cb;
+          sep7 = "";
           break;
         }
         case "newline":
           if (comment)
-            sep6 += source;
+            sep7 += source;
           hasSpace = true;
           break;
         default:
@@ -5653,18 +5686,18 @@ function resolveFlowCollection({ composeNode: composeNode2, composeEmptyNode: co
   let offset = fc.offset + fc.start.source.length;
   for (let i = 0; i < fc.items.length; ++i) {
     const collItem = fc.items[i];
-    const { start, key: key2, sep: sep6, value } = collItem;
+    const { start, key: key2, sep: sep7, value } = collItem;
     const props = resolveProps(start, {
       flow: fcName,
       indicator: "explicit-key-ind",
-      next: key2 ?? sep6?.[0],
+      next: key2 ?? sep7?.[0],
       offset,
       onError,
       parentIndent: fc.indent,
       startOnNewline: false
     });
     if (!props.found) {
-      if (!props.anchor && !props.tag && !sep6 && !value) {
+      if (!props.anchor && !props.tag && !sep7 && !value) {
         if (i === 0 && props.comma)
           onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
         else if (i < fc.items.length - 1)
@@ -5718,8 +5751,8 @@ function resolveFlowCollection({ composeNode: composeNode2, composeEmptyNode: co
         }
       }
     }
-    if (!isMap2 && !sep6 && !props.found) {
-      const valueNode = value ? composeNode2(ctx, value, props, onError) : composeEmptyNode2(ctx, props.end, sep6, null, props, onError);
+    if (!isMap2 && !sep7 && !props.found) {
+      const valueNode = value ? composeNode2(ctx, value, props, onError) : composeEmptyNode2(ctx, props.end, sep7, null, props, onError);
       coll.items.push(valueNode);
       offset = valueNode.range[2];
       if (isBlock(value))
@@ -5731,7 +5764,7 @@ function resolveFlowCollection({ composeNode: composeNode2, composeEmptyNode: co
       if (isBlock(key2))
         onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
       ctx.atKey = false;
-      const valueProps = resolveProps(sep6 ?? [], {
+      const valueProps = resolveProps(sep7 ?? [], {
         flow: fcName,
         indicator: "map-value-ind",
         next: value,
@@ -5742,8 +5775,8 @@ function resolveFlowCollection({ composeNode: composeNode2, composeEmptyNode: co
       });
       if (valueProps.found) {
         if (!isMap2 && !props.found && ctx.options.strict) {
-          if (sep6)
-            for (const st of sep6) {
+          if (sep7)
+            for (const st of sep7) {
               if (st === valueProps.found)
                 break;
               if (st.type === "newline") {
@@ -5760,7 +5793,7 @@ function resolveFlowCollection({ composeNode: composeNode2, composeEmptyNode: co
         else
           onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
       }
-      const valueNode = value ? composeNode2(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode2(ctx, valueProps.end, sep6, null, valueProps, onError) : null;
+      const valueNode = value ? composeNode2(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode2(ctx, valueProps.end, sep7, null, valueProps, onError) : null;
       if (valueNode) {
         if (isBlock(value))
           onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -5920,7 +5953,7 @@ function resolveBlockScalar(ctx, scalar2, onError) {
       chompStart = i + 1;
   }
   let value = "";
-  let sep6 = "";
+  let sep7 = "";
   let prevMoreIndented = false;
   for (let i = 0; i < contentStart; ++i)
     value += lines2[i][0].slice(trimIndent) + "\n";
@@ -5937,24 +5970,24 @@ function resolveBlockScalar(ctx, scalar2, onError) {
       indent = "";
     }
     if (type === Scalar.BLOCK_LITERAL) {
-      value += sep6 + indent.slice(trimIndent) + content;
-      sep6 = "\n";
+      value += sep7 + indent.slice(trimIndent) + content;
+      sep7 = "\n";
     } else if (indent.length > trimIndent || content[0] === "	") {
-      if (sep6 === " ")
-        sep6 = "\n";
-      else if (!prevMoreIndented && sep6 === "\n")
-        sep6 = "\n\n";
-      value += sep6 + indent.slice(trimIndent) + content;
-      sep6 = "\n";
+      if (sep7 === " ")
+        sep7 = "\n";
+      else if (!prevMoreIndented && sep7 === "\n")
+        sep7 = "\n\n";
+      value += sep7 + indent.slice(trimIndent) + content;
+      sep7 = "\n";
       prevMoreIndented = true;
     } else if (content === "") {
-      if (sep6 === "\n")
+      if (sep7 === "\n")
         value += "\n";
       else
-        sep6 = "\n";
+        sep7 = "\n";
     } else {
-      value += sep6 + content;
-      sep6 = " ";
+      value += sep7 + content;
+      sep7 = " ";
       prevMoreIndented = false;
     }
   }
@@ -6129,25 +6162,25 @@ function unfoldLines(source) {
     trimBoth = /^[ \t]+|[ \t]+$/g;
   }
   let res = match[1].replace(trimEnd, "");
-  let sep6 = " ";
+  let sep7 = " ";
   let pos = line3.lastIndex;
   while (match = line3.exec(source)) {
     const lm = match[1].replace(trimBoth, "");
     if (lm === "") {
-      if (sep6 === "\n")
-        res += sep6;
+      if (sep7 === "\n")
+        res += sep7;
       else
-        sep6 = "\n";
+        sep7 = "\n";
     } else {
-      res += sep6 + lm;
-      sep6 = " ";
+      res += sep7 + lm;
+      sep7 = " ";
     }
     pos = line3.lastIndex;
   }
   const last = /[ \t]*(.*)/sy;
   last.lastIndex = pos;
   match = last.exec(source);
-  return res + sep6 + (match?.[1] ?? "");
+  return res + sep7 + (match?.[1] ?? "");
 }
 function doubleQuotedValue(source, onError) {
   let res = "";
@@ -7764,18 +7797,18 @@ var Parser = class {
     if (this.type === "map-value-ind") {
       const prev = getPrevProps(this.peek(2));
       const start = getFirstKeyStartProps(prev);
-      let sep6;
+      let sep7;
       if (scalar2.end) {
-        sep6 = scalar2.end;
-        sep6.push(this.sourceToken);
+        sep7 = scalar2.end;
+        sep7.push(this.sourceToken);
         delete scalar2.end;
       } else
-        sep6 = [this.sourceToken];
+        sep7 = [this.sourceToken];
       const map2 = {
         type: "block-map",
         offset: scalar2.offset,
         indent: scalar2.indent,
-        items: [{ start, key: scalar2, sep: sep6 }]
+        items: [{ start, key: scalar2, sep: sep7 }]
       };
       this.onKeyLine = true;
       this.stack[this.stack.length - 1] = map2;
@@ -7928,15 +7961,15 @@ var Parser = class {
             } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
               const start2 = getFirstKeyStartProps(it.start);
               const key2 = it.key;
-              const sep6 = it.sep;
-              sep6.push(this.sourceToken);
+              const sep7 = it.sep;
+              sep7.push(this.sourceToken);
               delete it.key;
               delete it.sep;
               this.stack.push({
                 type: "block-map",
                 offset: this.offset,
                 indent: this.indent,
-                items: [{ start: start2, key: key2, sep: sep6 }]
+                items: [{ start: start2, key: key2, sep: sep7 }]
               });
             } else if (start.length > 0) {
               it.sep = it.sep.concat(start, this.sourceToken);
@@ -8130,13 +8163,13 @@ var Parser = class {
         const prev = getPrevProps(parent);
         const start = getFirstKeyStartProps(prev);
         fixFlowSeqItems(fc);
-        const sep6 = fc.end.splice(1, fc.end.length);
-        sep6.push(this.sourceToken);
+        const sep7 = fc.end.splice(1, fc.end.length);
+        sep7.push(this.sourceToken);
         const map2 = {
           type: "block-map",
           offset: fc.offset,
           indent: fc.indent,
-          items: [{ start, key: fc, sep: sep6 }]
+          items: [{ start, key: fc, sep: sep7 }]
         };
         this.onKeyLine = true;
         this.stack[this.stack.length - 1] = map2;
@@ -8757,10 +8790,11 @@ function boundSeverityByEvidence(derived, candidate, verification2) {
       `the verifier traced impact beyond the changed code (impact_traced: true) at confidence ${confidence.toFixed(2)}, at least ${ESCALATION_CONFIDENCE}`
     );
   }
+  const tracedBelowBar = verification2?.impactTraced === true;
   return {
     ...result,
     severity: TIER_ORDER[asked],
-    reason: `${result.reason}, held at ${candidate.severity} because escalation needs the verifier to trace impact beyond the changed code`
+    reason: tracedBelowBar ? `${result.reason}, held at ${candidate.severity} because the verifier traced the impact at confidence ${confidence === null ? "unknown" : confidence.toFixed(2)}, and escalation needs at least ${ESCALATION_CONFIDENCE}` : `${result.reason}, held at ${candidate.severity} because escalation needs the verifier to trace impact beyond the changed code`
   };
 }
 function raisedBecause(result, requested, why) {
@@ -9176,7 +9210,7 @@ function isBareDirection(direction) {
 function editorFix(fix) {
   if (fix.render === "fix") return { render: "fix", text: fix.suggested };
   if (fix.render === "direction") return { render: "direction", text: fix.direction };
-  return { render: "none", text: null };
+  return { render: "none", text: null, ...fix.withheld === void 0 ? {} : { withheld: fix.withheld } };
 }
 function assertUniqueCandidateIds(candidates) {
   const seen = /* @__PURE__ */ new Set();
@@ -9244,7 +9278,9 @@ function renderFix(candidate, verification2, thresholds) {
     confidence,
     direction,
     render: "none",
-    reason: verifierReason ?? reason2
+    reason: verifierReason ?? reason2,
+    // Only a repair that was proposed can be withheld.
+    ...hasSuggested ? { withheld: reason2 } : {}
   };
 }
 function ownerRaiseCeiling(severity, candidate, verification2, lane) {
@@ -9283,8 +9319,8 @@ function scoreCandidate(candidate, precedents, kept, thresholds = DEFAULT_THRESH
   const missingContext = missing.length > 0;
   const admitted = admitsUnverifiable(candidate);
   const verifierEngaged = verification2?.technicalConfidence !== void 0;
-  if ((missingContext || admitted && !verifierEngaged) && confidence > UNVERIFIABLE_CONFIDENCE) {
-    confidence = UNVERIFIABLE_CONFIDENCE;
+  if (missingContext || admitted && !verifierEngaged && confidence > UNVERIFIABLE_CONFIDENCE) {
+    confidence = Math.min(confidence, UNVERIFIABLE_CONFIDENCE);
     confidenceSource = "unverifiable-cap";
   }
   const unverifiableBecause = confidenceSource !== "unverifiable-cap" ? null : missingContext ? `the verifier listed required_context_missing the claim depends on: ${missing.join("; ")}` : "the analyst's evidence says the claim could not be checked, and the verifier gave no technical_confidence of its own";
@@ -9847,7 +9883,7 @@ var GitHubClient = class {
     }
     this.baseUrl = options.baseUrl ?? "https://api.github.com";
     this.doFetch = options.fetchImpl ?? fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolve16) => setTimeout(resolve16, ms)));
+    this.sleep = options.sleep ?? ((ms) => new Promise((resolve17) => setTimeout(resolve17, ms)));
     this.token = options.token ?? null;
   }
   authorization() {
@@ -10724,7 +10760,7 @@ var CODE_RULES = [
   {
     kind: "unsafe",
     in: "code",
-    pattern: /\bunsafe\b|\beval\s*\(|\bexec\s*\(|\bdangerouslySetInnerHTML\b|\bMarshal\.|\bpickle\.loads\b/g
+    pattern: /\bunsafe\b|\beval\s*\(|\bdangerouslySetInnerHTML\b|\bMarshal\.|\bpickle\.loads\b/g
   },
   {
     // A loader that names SafeLoader on the same line is the safe form.
@@ -10734,6 +10770,12 @@ var CODE_RULES = [
     accept: (_match, line3) => !/SafeLoader/.test(line3.code)
   }
 ];
+var EXEC_RULE = { kind: "unsafe", in: "code", pattern: /\bexec\s*\(/g };
+var SCRIPT_EXEC_RULE = {
+  kind: "unsafe",
+  in: "code",
+  pattern: /(?<![\w$.])exec\s*\(|\b(?:child_process|childProcess|cp)\.exec\s*\(/g
+};
 var URL_RULE = { kind: "new-route", in: "code", pattern: /(?<![\w.])path\s*\(/g };
 function buildsQuery(code3, raw, quotes, triple, at2) {
   let index = 0;
@@ -10770,7 +10812,8 @@ function queryRule(quotes, triple) {
 }
 function language2(quotes, lineComment2, blockComments, regexLiterals = false, tripleQuotes = false) {
   return {
-    rules: [...CODE_RULES, queryRule(quotes, tripleQuotes)],
+    // Only the script languages have regex literals, so the flag names them.
+    rules: [...CODE_RULES, regexLiterals ? SCRIPT_EXEC_RULE : EXEC_RULE, queryRule(quotes, tripleQuotes)],
     quotes,
     lineComment: lineComment2,
     blockComments,
@@ -10806,10 +10849,25 @@ function kindsIn3(text5, lang, urls) {
   }
   return [...kinds];
 }
+var INTERPRETERS = [
+  [/\b(?:node|bun|deno)\b/, ".js"],
+  [/\bpython[\d.]*\b/, ".py"],
+  [/\bruby\b/, ".rb"],
+  [/\bphp\b/, ".php"]
+];
+function languageOf2(path, firstLine3) {
+  const extension = extname3(path).toLowerCase();
+  if (extension !== "") return LANGUAGES4[extension];
+  if (firstLine3 === void 0 || firstLine3.line !== 1 || !firstLine3.text.startsWith("#!")) return void 0;
+  const interpreter = INTERPRETERS.find(([pattern]) => pattern.test(firstLine3.text));
+  return interpreter === void 0 ? void 0 : LANGUAGES4[interpreter[1]];
+}
 function findRiskMarkers(diff, paths) {
   const found2 = [];
+  const languages = /* @__PURE__ */ new Map();
   for (const hunk of countHunks(diff, new Set(paths))) {
-    const lang = LANGUAGES4[extname3(hunk.path).toLowerCase()];
+    if (!languages.has(hunk.path)) languages.set(hunk.path, languageOf2(hunk.path, hunk.added[0]));
+    const lang = languages.get(hunk.path);
     if (lang === void 0) continue;
     const urls = /^urls?$/i.test(basename2(hunk.path, extname3(hunk.path)));
     for (const { line: line3, text: text5 } of hunk.added) {
@@ -12144,13 +12202,18 @@ function describeFamilies(families) {
   if (families === null) return "Families not recorded";
   return `Families second-pass ${families.secondPass ?? "none"}, challenge ${families.challenge ?? "none"}`;
 }
-function familiesOf(verdicts, stages) {
+function familiesOf(verdicts, stages, scores) {
   const list3 = Array.isArray(verdicts) ? verdicts : [];
   const first = list3.length === 0 ? void 0 : asRecord(list3[0])?.["family"];
   const challenge2 = stages.find((stage) => stage.name === "challenge");
+  const ran = (score2) => {
+    const challenge3 = asRecord(asRecord(score2)?.["challenge"]);
+    return challenge3 !== null && !/^challenger (?:not run|failed)\b/.test(String(challenge3["reason"] ?? ""));
+  };
+  const challenged = Array.isArray(scores) && scores.some(ran);
   return {
     secondPass: list3.length === 0 ? null : isFamily(first) ? first : "unknown",
-    challenge: challenge2 === void 0 ? null : isFamily(challenge2.family) ? challenge2.family : "claude"
+    challenge: challenge2 === void 0 ? challenged ? "claude" : null : isFamily(challenge2.family) ? challenge2.family : "claude"
   };
 }
 var reportedFamilies = /* @__PURE__ */ new Set();
@@ -12592,7 +12655,7 @@ function recordRun(db, input) {
     mode: input.provenance.mode,
     policyVersions
   };
-  const families = provenance === null ? null : familiesOf(input.verdicts, input.stages ?? []);
+  const families = provenance === null ? null : familiesOf(input.verdicts, input.stages ?? [], input.scores);
   db.exec("SAVEPOINT record_run");
   try {
     db.prepare(
@@ -14509,9 +14572,9 @@ function stopCommandsOnSignal() {
   };
 }
 function spawnCommand(command, options) {
-  return new Promise((resolve16) => {
+  return new Promise((resolve17) => {
     if (options.signal?.aborted === true) {
-      resolve16({ status: null, stdout: "", stderr: "", error: Object.assign(new Error(`spawn ${command} ABORT_ERR`), { code: "ABORT_ERR" }) });
+      resolve17({ status: null, stdout: "", stderr: "", error: Object.assign(new Error(`spawn ${command} ABORT_ERR`), { code: "ABORT_ERR" }) });
       return;
     }
     const child = spawnChild(command, options.args ?? [], { cwd: options.cwd, env: options.env, shell: options.shell, detached: options.detached, stdio: "pipe" });
@@ -14549,7 +14612,7 @@ function spawnCommand(command, options) {
         killGroup(pid, "SIGKILL");
         runningGroups.delete(pid);
       }
-      resolve16({
+      resolve17({
         status,
         stdout: Buffer.concat(chunks.stdout).toString(options.encoding),
         stderr: Buffer.concat(chunks.stderr).toString(options.encoding),
@@ -18895,10 +18958,10 @@ async function raisedByOthers(options, run, findings) {
   const { comments } = await readThread({ repository: options.repository, pullNumber: options.pullNumber, client: options.client });
   const mine = new Set(comments.filter((c) => c.author.toLowerCase() === me && c.id !== void 0).map((c) => c.id));
   const started = Date.parse(run.createdAt);
-  const squash = (text5) => text5.toLowerCase().replace(/\s+/g, " ").trim();
-  const ownTexts = comments.filter((c) => c.author.toLowerCase() === me).map((c) => squash(c.body));
+  const squash2 = (text5) => text5.toLowerCase().replace(/\s+/g, " ").trim();
+  const ownTexts = comments.filter((c) => c.author.toLowerCase() === me).map((c) => squash2(c.body));
   const thread = comments.filter((comment) => comment.author.toLowerCase() !== me).map((comment) => ({ ...comment, body: comment.body.split("\n").filter((line3) => !/^\s*>/.test(line3)).join("\n") })).filter((comment) => {
-    const text5 = squash(comment.body);
+    const text5 = squash2(comment.body);
     return text5 !== "" && !(text5.length >= PASTED_TEXT_MIN && ownTexts.some((own) => own.includes(text5)));
   }).filter((comment) => comment.createdAt === void 0 || !(Date.parse(comment.createdAt) <= started)).filter((comment) => comment.inReplyTo === void 0 || !mine.has(comment.inReplyTo)).flatMap((comment) => citedLocations([comment]).map((located) => ({ comment: located, url: comment.url ?? null })));
   if (thread.length === 0) return [];
@@ -19234,13 +19297,13 @@ function lockPort(dataDir) {
 var answer = (dataDir) => `review-voice-watch ${process.pid} ${dataDir}
 `;
 function probe(port) {
-  return new Promise((resolve16) => {
+  return new Promise((resolve17) => {
     const socket = connect({ host: "127.0.0.1", port });
     let text5 = "";
     const done = (pid) => {
       clearTimeout(timer);
       socket.destroy();
-      resolve16(pid);
+      resolve17(pid);
     };
     const timer = setTimeout(() => done(null), PROBE_MS);
     socket.setEncoding("utf8");
@@ -19265,16 +19328,16 @@ async function acquireLock(dataDir, port = lockPort(dataDir), patience = DEFAULT
       socket.once("data", () => socket.end(answer(dataDir)));
     });
     const listening = server;
-    const failure = await new Promise((resolve16) => {
-      listening.once("error", (error) => resolve16(error));
-      listening.listen({ host: "127.0.0.1", port, exclusive: true }, () => resolve16(null));
+    const failure = await new Promise((resolve17) => {
+      listening.once("error", (error) => resolve17(error));
+      listening.listen({ host: "127.0.0.1", port, exclusive: true }, () => resolve17(null));
     });
     if (failure === null) break;
     if (failure.code !== "EADDRINUSE") throw failure;
     const holder = await probe(port);
     if (holder !== null) return { holder };
     if (attempt >= patience.tries) return { foreign: port };
-    await new Promise((resolve16) => setTimeout(resolve16, patience.waitMs));
+    await new Promise((resolve17) => setTimeout(resolve17, patience.waitMs));
   }
   server.unref();
   const display = join9(dataDir, "watch.lock");
@@ -19738,7 +19801,7 @@ function killGroup2(pid, signal2) {
 function spawnReview(bundle, options) {
   const graceMs = options.graceMs ?? 1e4;
   const live2 = /* @__PURE__ */ new Map();
-  const review2 = ({ repository, pull, clone, post, mode, expectHead, timeoutMs, runRepositoryCommands }) => new Promise((resolve16) => {
+  const review2 = ({ repository, pull, clone, post, mode, expectHead, timeoutMs, runRepositoryCommands }) => new Promise((resolve17) => {
     const args = [bundle, "review", "--pr", String(pull), "--repository", repository, "--json", "--expect-head", expectHead, "--origin", "watch"];
     if (post) args.push("--post", "--recheck-thread");
     if (mode !== void 0) args.push("--mode", mode);
@@ -19775,10 +19838,10 @@ function spawnReview(bundle, options) {
       if (pid !== void 0) live2.delete(pid);
       markDone();
       if (timedOut) {
-        resolve16({ exitCode: 124, runId: null, event: null, reviewUrl: null, detail: `review timed out after ${formatDuration(timeoutMs)}` });
+        resolve17({ exitCode: 124, runId: null, event: null, reviewUrl: null, detail: `review timed out after ${formatDuration(timeoutMs)}` });
       } else {
         const why = stderr.length > 0 ? stderr : exitSignal !== null ? `killed by ${exitSignal}` : spawnError;
-        resolve16(reviewResult(exitCode ?? 1, stdout, why));
+        resolve17(reviewResult(exitCode ?? 1, stdout, why));
       }
     };
     const terminate = () => {
@@ -20059,8 +20122,11 @@ var COMMAND_HELP = {
   "check-verification": {
     summary: "Validate verifier output from stdin, as score would",
     body: lines(
-      "review-voice check-verification [--candidates <path>]",
-      "  Validate verifier output the way score would read it.",
+      "review-voice check-verification [--candidates <path>] [--out <path>]",
+      "  Validate verifier output the way score would read it. A reply with text or a code fence",
+      "  around its JSON is read for the JSON alone, and says so on stderr.",
+      "  --out         Write the checked JSON, without the text around it, to this file.",
+      '  also_at, when present, is a list of at most 10 "path:line" references.',
       "  Use verified and technical_confidence; verdict and confidence belong to the second pass.",
       "  --candidates  check-candidates output (or a candidates array); refuses output that",
       "                skips a kept candidate, so the verifier can be re-asked for it.",
@@ -20130,7 +20196,8 @@ var COMMAND_HELP = {
       "  --ref <ref>            Read every document from this commit instead of the checkout; a pull",
       "                         request review passes its base. Symbolic links in it are not followed.",
       "Reads: nothing on stdin.",
-      "Writes: JSON on stdout.",
+      "Writes: JSON on stdout, with searched, every place looked in. When nothing was found, one",
+      "  line on stderr says so and where it looked.",
       "Exit codes: 0 ok, 2 bad invocation or --ref does not resolve."
     )
   },
@@ -20232,7 +20299,12 @@ var COMMAND_HELP = {
       "  base-like file.",
       "",
       "Flags:",
-      "  --pr <n>               the pull request number (required)",
+      "  --pr <n>               the pull request number (this or --base is required)",
+      "  --base <ref>           review HEAD of this checkout against its merge base with <ref>, with no",
+      "                         pull request: nothing is read from GitHub, there is no thread, carry,",
+      "                         verdict or post, the configuration and conventions come from the merge",
+      "                         base, and the run is recorded with no pull number. The agents still call",
+      "                         the model. --post, --since, --full and --no-recheck-thread are refused",
       "  --dir <dir>            the review's directory, where the base commit's copy is written; created if missing (required)",
       "  --repository <o/r>     default: the origin remote",
       "  --config <path>        read this file; beats REVIEW_VOICE_CONFIG and the base commit",
@@ -20423,7 +20495,9 @@ var COMMAND_HELP = {
       "  suppression held is listed in suppressed[] with its ruleId and policyVersion, and",
       "  --promote posts it past that policy. --as-question sets the tier to question with",
       "  ownerQuestion: true, which record stores and explain shows, and ownerQuestionFrom, the",
-      "  tier verdict.min_posted_tier still ranks it by. Every entry names its candidate as candidate_id,",
+      "  tier verdict.min_posted_tier still ranks it by. A candidate that is not eligible is in exactly",
+      "  one of belowGate[], suppressed[], unverified[], absenceContradicted[] and rejected[]; rejected[]",
+      "  holds every other one, with its rejectedBecause. Every entry names its candidate as candidate_id,",
       "  like candidates and verification; candidateId is still written beside it",
       "  but is deprecated.",
       "Exit codes: 0 ok, 2 malformed candidates or bad invocation."
@@ -21013,14 +21087,17 @@ var COMMAND_HELP = {
   challenge: {
     summary: "Build challenger prompts, or apply challenger verdicts to scores",
     body: lines(
-      "review-voice challenge --scores <path> --candidates <path> [--intent <path>] [--reproductions <path>] --emit-prompts",
-      "review-voice challenge --scores <path> --candidates <path> --diff-file <path> [--reproductions <path>] [--out <path>] < verdicts.json",
+      "review-voice challenge --scores <path> --candidates <path> [--intent <path>] [--reproductions <path>] [--cwd <dir>] [--head <sha>] --emit-prompts",
+      "review-voice challenge --scores <path> --candidates <path> --diff-file <path> [--reproductions <path>] [--cwd <dir>] [--out <path>] < verdicts.json",
       "  The independent challenge (adr/0024). With --emit-prompts, print one challenger prompt per",
-      "  eligible finding: its claim, failure mode, category, location and the intent it cites, never",
+      "  eligible finding: its claim, failure mode, category, location, where the code at the head",
+      "  can be read and the intent it cites, never",
       "  the verifier's reasoning, confidence or evidence. Otherwise check the challenger verdicts on",
       "  stdin and apply them: confirmed with line_ok passes; confirmed with corrected_line moves the",
       "  anchor by the reanchor rules (a refused move holds it as challenge-partly); partly holds it",
-      "  as challenge-partly and refuted as challenge-refuted.",
+      "  as challenge-partly and refuted as challenge-refuted. A question confirmed with answered:",
+      "  true is stated at minor, with the challenger's reason as challengeAnswer; nothing raises it",
+      "  further, and a question posted with score --as-question stays one.",
       "",
       "Flags:",
       "  --scores <path>        The JSON `score` printed (required)",
@@ -21034,12 +21111,21 @@ var COMMAND_HELP = {
       "                         applying, a decisive entry naming a reproduction file is dropped",
       "  --diff-file <path>     The reviewed diff; a corrected line must be changed in it (required",
       "                         to apply; with --emit-prompts, named in each prompt)",
+      "  --cwd <dir>            With --emit-prompts, the checkout of the head each prompt names as",
+      "                         where to read the code (default: the root of the current repository).",
+      "                         Applying, the checkout a confirmed verdict's decisive_evidence is read",
+      "                         in: a reference to a file that is not there, to a line past its end, or",
+      "                         to a range that does not hold the line quoted in decisive_quotes holds",
+      "                         the finding as challenge-partly; a quote found on one other line of the",
+      "                         file moves the reference there. Without it the references are not read",
+      "  --head <sha>           With --emit-prompts, the head commit each prompt names",
       "  --out <path>           Write the challenged scores here instead of stdout",
       'Reads: with --emit-prompts nothing on stdin; otherwise {"verdicts": [{"candidate_id",',
-      '  "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "reason"}]} on stdin.',
+      '  "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "decisive_quotes"?, "answered"?, "reason"}]}',
+      "  on stdin.",
       'Writes: with --emit-prompts {"prompts": [{"candidate_id", "prompt"}]} on stdout. Otherwise the',
       "  scores with held findings moved from eligible[] to challengeHeld[] (record --held entries),",
-      "  moved anchors updated, and challenge: {confirmed, held, moved}; to --out (a summary on",
+      "  moved anchors updated, and challenge: {confirmed, held, moved, answered}; to --out (a summary on",
       "  stdout) or stdout.",
       "Exit codes: 0 ok, 2 bad invocation, unreadable input, or a refused verdict set: an eligible",
       "  finding without a verdict, a verdict for one that is not eligible, or a verdict whose fields",
@@ -21142,7 +21228,9 @@ var COMMAND_HELP = {
       "Flags:",
       "  --json                     Emit the result as JSON",
       "  --max-findings <n>         Default: no cap",
-      "  --scale-to-files <n>       Scale the total word budget to the change size",
+      "  --scale-to-files <n>       Scale the total word budget to the change size; the limit is the",
+      "                             larger of this and --max-total-words, and the output says when",
+      "                             scaling raised an explicit --max-total-words",
       `  --max-words-per-finding <n>  Default ${DEFAULT_LIMITS.maxWordsPerFinding}`,
       `  --max-total-words <n>      Default ${DEFAULT_LIMITS.maxTotalWords}`,
       "  --scores <path>            The JSON `score` printed; a severity tag that disagrees with its score,",
@@ -21157,6 +21245,7 @@ var COMMAND_HELP = {
     summary: "Review one pull request end to end, agents included",
     body: lines(
       "review-voice review --pr <n> [--repository owner/repo] [--mode fast|standard|thorough|auto]",
+      "review-voice review --base <ref> [--repository owner/repo] [--mode ...] [--out <dir>] [--config <path>] [--json]",
       "                    [--post] [--no-recheck-thread] [--expect-head <sha>] [--out <dir>]",
       "                    [--since <sha>] [--full] [--config <path>] [--origin watch|action] [--json]",
       "  Run every review stage in a clone of the repository (docs/adr/0022): diff, thread,",
@@ -21473,7 +21562,7 @@ function interpretEnvelope(stdout, stderr, code3) {
   return { ok: false, output: null, costUsd, ...counted, error: detail };
 }
 function spawnWatched(bin, args, input, options) {
-  return new Promise((resolve16) => {
+  return new Promise((resolve17) => {
     const child = spawn2(process.execPath, ["-e", WATCHDOG, "--", bin, ...args], {
       cwd: options.cwd,
       env: options.env,
@@ -21492,7 +21581,7 @@ function spawnWatched(bin, args, input, options) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve16(result);
+      resolve17(result);
     };
     const stop = (reason2) => {
       stopped ??= reason2;
@@ -22034,6 +22123,7 @@ var COMMENT_LINE = /^ {0,3}<!--(?:(?!--!?>).)*--!?>\s*$/u;
 var COMMENT_OPEN = /^ {0,3}<!--(?!-?>)(?:(?!--!?>).)*$/u;
 var COMMENT_CLOSE = /^(?:(?!--!?>).)*--!?>\s*$/u;
 var BOLD_LABEL = /^\*\*([^*]*[^*\s.!?])\*\*$/u;
+var THEMATIC_BREAK = /^ {0,3}([-*_])(?: *\1){2,} *$/u;
 var collapse2 = (text5) => text5.replace(/\s+/gu, " ").trim();
 var isBoldLabel = (line3) => !LIST_OR_HEADING.test(line3) && BOLD_LABEL.test(collapse2(line3));
 function lineKinds(lines2) {
@@ -22080,7 +22170,7 @@ function sentencesOf(description) {
   for (const [index, line3] of lines2.entries()) {
     const marked = LIST_OR_HEADING.test(line3);
     const content = collapse2(line3.replace(LIST_OR_HEADING, ""));
-    if (content === "") {
+    if (content === "" || THEMATIC_BREAK.test(line3) && (blank || text5 === "") && !fenced.has(index)) {
       blank = true;
       continue;
     }
@@ -22163,14 +22253,15 @@ function widenToSentence(quote3, sentences) {
   const sentence = sentences.text.slice(from, to);
   return sentence.length <= MAX_QUOTE ? sentence : null;
 }
-function answeredHeading(quote3, sentences) {
+function answeredHeadings(quote3, sentences) {
   const wanted = collapse2(quote3.replace(LIST_OR_HEADING, ""));
-  if (wanted === "" || wanted.split(" ").length >= MIN_QUOTE_WORDS) return null;
+  if (wanted === "" || wanted.split(" ").length >= MIN_QUOTE_WORDS) return [];
   const matches = ({ from, to }) => {
     const body = sentences.text.slice(from, to);
     return body === wanted || body === `${wanted}.`;
   };
-  return (sentences.sections.find(matches) ?? sentences.answers.find(matches))?.heading ?? null;
+  const found2 = sentences.sections.filter(matches);
+  return [...new Set((found2.length > 0 ? found2 : sentences.answers.filter(matches)).map(({ heading }) => heading))];
 }
 var whereOf = (source) => source.issue === null ? "the description" : `issue #${source.issue}`;
 function excerptOf(value, sentences, name, id, notes, where) {
@@ -22189,8 +22280,8 @@ function quoteFrom(value, sources, name, id, notes) {
   let problem = null;
   const notFound = `${name} does not occur in the pull request description`;
   for (const source of sources) {
-    const answered = answeredHeading(value, source.sentences);
-    const quote3 = answered === null ? excerptOf(value, source.sentences, name, id, notes, whereOf(source)) : { value, problem: null };
+    const answered = answeredHeadings(value, source.sentences);
+    const quote3 = answered.length === 0 ? excerptOf(value, source.sentences, name, id, notes, whereOf(source)) : { value, problem: null };
     if (quote3.problem === null) return { value: quote3.value, source, answered, problem: null };
     if (problem === null && quote3.problem !== notFound) problem = quote3.problem;
   }
@@ -22236,11 +22327,15 @@ function statementOf(rawEntry, at2, sources, removed) {
   if (rawQuote.problem !== null) return { value: null, problem: rawQuote.problem };
   const quote3 = quoteFrom(rawQuote.value, sources, `${at2}.quote`, id, removed);
   if (quote3.problem !== null) return { value: null, problem: quote3.problem };
-  const { source, answered } = quote3;
+  const { source } = quote3;
+  const statementWords = significantWords(statement.value);
+  const shared = (heading2) => [...significantWords(heading2)].filter((word) => statementWords.has(word)).length;
+  const supplied = entry["heading"];
+  const answered = quote3.answered.find((heading2) => heading2 === supplied) ?? quote3.answered.reduce((best, heading2) => best === null || shared(heading2) > shared(best) ? heading2 : best, null);
   const heading = answered ?? (isShort(quote3.value) ? sectionHeading(quote3.value, source.sentences) : null);
   if (kind !== "non-goal") {
     const quoted = significantWords(answered === null ? quote3.value : `${answered} ${quote3.value}`);
-    if (![...significantWords(statement.value)].some((word) => quoted.has(word))) {
+    if (![...statementWords].some((word) => quoted.has(word))) {
       return { value: null, problem: `${at2}.quote shares no significant word with its statement` };
     }
   }
@@ -22307,7 +22402,7 @@ function parseIntent(value, description, issues = []) {
 }
 
 // plugins/review-voice/src/verify/challenge.ts
-import { posix as posix5 } from "node:path";
+import { isAbsolute as isAbsolute4, posix as posix5 } from "node:path";
 var CHALLENGE_VERDICTS = ["confirmed", "partly", "refuted"];
 var isRecord4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var idOf2 = (entry) => {
@@ -22333,7 +22428,7 @@ function intentStatements(parsed2) {
   const list3 = isRecord4(parsed2) && Array.isArray(parsed2["statements"]) ? parsed2["statements"] : Array.isArray(parsed2) ? parsed2 : [];
   return list3.filter((s) => isRecord4(s) && typeof s["id"] === "string");
 }
-function challengePrompt(finding, candidate, statements, diffFile, reproduction) {
+function challengePrompt(finding, candidate, statements, diffFile, reproduction, head = {}) {
   const pick = (snake, camel) => text3(candidate?.[snake]) ?? text3(candidate?.[camel]) ?? text3(finding[snake]) ?? text3(finding[camel]);
   const id = idOf2(finding) ?? (candidate === void 0 ? null : idOf2(candidate)) ?? "unknown";
   const path = text3(finding["path"]) ?? text3(candidate?.["path"]) ?? "unknown";
@@ -22352,7 +22447,13 @@ function challengePrompt(finding, candidate, statements, diffFile, reproduction)
   if (causedBy !== null && typeof causedBy["path"] === "string" && Number.isInteger(causedBy["line"])) {
     rows.push(`Stale consumer of the changed line: ${causedBy["path"]}:${String(causedBy["line"])}`);
   }
+  if (finding["severity"] === "question") {
+    rows.push('Raised as a question. Add "answered": true only when your decisive evidence settles its answer as a defect.');
+  }
   if (diffFile !== void 0 && diffFile !== null) rows.push(`Diff under review: ${diffFile}`);
+  const commit = head.sha === void 0 || head.sha === null ? null : `commit ${head.sha}`;
+  if (head.dir !== void 0 && head.dir !== null) rows.push(`Code at the head: ${head.dir}${commit === null ? "" : ` (${commit})`}`);
+  else if (commit !== null) rows.push(`Head under review: ${commit}`);
   if (reproduction !== void 0) rows.push(...reproductionRows(reproduction));
   if (cited.length > 0) {
     const from = [...new Set(cited.map((s) => typeof s.issue === "number" ? `linked issue #${s.issue}` : "the pull request description"))];
@@ -22365,7 +22466,7 @@ function challengePrompt(finding, candidate, statements, diffFile, reproduction)
   rows.push(
     "",
     "You are not given the verifier's reasoning, confidence or evidence. Read the code at the head yourself.",
-    `Return {"verdicts": [{"candidate_id": "${id}", "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "reason"}]}.`
+    `Return {"verdicts": [{"candidate_id": "${id}", "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "decisive_quotes", "reason"}]}.`
   );
   return rows.join("\n");
 }
@@ -22396,10 +22497,10 @@ function reproductionsById(parsed2) {
   }
   return out;
 }
-function challengePrompts(scores, candidates, statements, diffFile, reproductions = /* @__PURE__ */ new Map()) {
+function challengePrompts(scores, candidates, statements, diffFile, reproductions = /* @__PURE__ */ new Map(), head = {}) {
   return eligibleFindings(scores).map((finding) => {
     const id = idOf2(finding) ?? "unknown";
-    return { candidate_id: id, prompt: challengePrompt(finding, candidates.get(id), statements, diffFile, reproductions.get(id)) };
+    return { candidate_id: id, prompt: challengePrompt(finding, candidates.get(id), statements, diffFile, reproductions.get(id), head) };
   });
 }
 var DECISIVE2 = /^\S(?:.*\S)?:\d+(?:-\d+)?$/u;
@@ -22431,6 +22532,11 @@ function parseChallengeVerdicts(raw) {
       problems.push(`${name}: decisive_evidence must be a list of "path:line" references`);
     }
     if (typeof entry["reason"] !== "string") problems.push(`${name}: reason must be a string`);
+    const quotes = entry["decisive_quotes"];
+    if (quotes !== void 0 && (!Array.isArray(quotes) || quotes.some((q) => typeof q !== "string") || Array.isArray(decisive) && quotes.length !== decisive.length)) {
+      problems.push(`${name}: decisive_quotes must be a list of strings, one per decisive_evidence entry`);
+    }
+    if (entry["answered"] !== void 0 && typeof entry["answered"] !== "boolean") problems.push(`${name}: answered must be true or false`);
     if (problems.length > before) return;
     const lineOk = entry["line_ok"];
     const reason2 = entry["reason"].trim();
@@ -22443,12 +22549,16 @@ function parseChallengeVerdicts(raw) {
     }
     if (lineOk && corrected !== void 0) problems.push(`${name}: line_ok true contradicts corrected_line`);
     if (label2 !== "confirmed" && reason2.length === 0) problems.push(`${name}: ${String(label2)} gives no reason`);
+    const answered = label2 === "confirmed" && entry["answered"] === true;
+    if (answered && reason2.length === 0) problems.push(`${name}: answered gives no reason, which is the answer`);
     verdicts.push({
       candidate_id: id,
       verdict: label2,
       line_ok: lineOk,
       ...corrected === void 0 ? {} : { corrected_line: corrected },
       decisive_evidence: evidence,
+      ...quotes === void 0 ? {} : { decisive_quotes: quotes },
+      ...answered ? { answered } : {},
       reason: reason2
     });
   });
@@ -22463,7 +22573,61 @@ function withoutReproductionFiles(evidence, reproductions) {
     return !local.has(path) && !local.has(posix5.basename(path));
   });
 }
-function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = /* @__PURE__ */ new Map()) {
+var squash = (value) => value.replace(/\s+/g, " ").trim();
+var MIN_QUOTE = 6;
+function checkDecisive(verdict2, read, touched, skip2) {
+  const evidence = [];
+  for (const [index, entry] of verdict2.decisive_evidence.entries()) {
+    const parts = /^(.*):(\d+)(?:-(\d+))?$/.exec(entry.replace(/[\p{Cf}`]/gu, "").trim());
+    const path = parts === null ? "" : posix5.normalize(parts[1].trim());
+    if (parts === null || isAbsolute4(path) || skip2(entry)) {
+      evidence.push(entry);
+      continue;
+    }
+    const file2 = path.includes("/") ? path : touched.find((known) => posix5.basename(known) === path) ?? path;
+    const lines2 = read(file2);
+    if (lines2 === null) {
+      if (!touched.includes(file2)) return { problem: `${entry} names a file that is not at the head` };
+      evidence.push(entry);
+      continue;
+    }
+    const start = Number(parts[2]);
+    const end = Math.max(start, Number(parts[3] ?? parts[2]));
+    if (end > lines2.length) return { problem: `${entry} is past the end of the file at the head (${lines2.length} lines)` };
+    const quote3 = squash(verdict2.decisive_quotes?.[index] ?? "");
+    const holds = (line3) => squash(lines2[line3 - 1] ?? "").includes(quote3);
+    if (quote3.length < MIN_QUOTE || lines2.slice(start - 1, end).some((_, offset) => holds(start + offset))) {
+      evidence.push(entry);
+      continue;
+    }
+    const elsewhere = lines2.flatMap((_, at2) => holds(at2 + 1) ? [at2 + 1] : []);
+    if (elsewhere.length !== 1) return { problem: `${entry} does not hold the line the challenger quoted` };
+    const moved = elsewhere[0];
+    evidence.push(`${path}:${moved}${end > start ? `-${Math.min(lines2.length, moved + end - start)}` : ""}`);
+  }
+  return { evidence };
+}
+var TIER_ORDER2 = ["blocking", "important", "minor", "nit", "question"];
+var ANSWERED = "the challenger answered the question with evidence, so it is stated at minor";
+function stateAnswered(document, answers) {
+  if (answers.size === 0) return document;
+  const answerOf = (entry) => isRecord4(entry) ? answers.get(idOf2(entry) ?? "") : void 0;
+  const scores = document["scores"].map((entry) => {
+    const answer2 = answerOf(entry);
+    if (answer2 === void 0 || !isRecord4(entry)) return entry;
+    const severity = isRecord4(entry["severity"]) ? entry["severity"] : {};
+    return { ...entry, severity: { ...severity, severity: "minor", reason: `${String(severity["reason"] ?? "a question")}; ${ANSWERED}` }, challengeAnswer: answer2 };
+  });
+  const finalScore = new Map(scores.filter(isRecord4).map((entry) => [idOf2(entry), Number(entry["finalScore"]) || 0]));
+  const eligible = document["eligible"].filter(isRecord4).map((entry) => {
+    const answer2 = answerOf(entry);
+    return answer2 === void 0 ? entry : { ...entry, severity: "minor", severityReason: `${String(entry["severityReason"] ?? "a question")}; ${ANSWERED}`, challengeAnswer: answer2 };
+  });
+  const rank2 = (entry) => TIER_ORDER2.indexOf(String(entry["severity"]));
+  eligible.sort((a, b) => rank2(a) - rank2(b) || (finalScore.get(idOf2(b)) ?? 0) - (finalScore.get(idOf2(a)) ?? 0));
+  return { ...document, scores, eligible };
+}
+function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = /* @__PURE__ */ new Map(), readHead3 = null) {
   if (!isRecord4(scores) || !Array.isArray(scores["scores"]) || !Array.isArray(scores["eligible"])) {
     return { ok: false, problems: ["expected the JSON `RV score` printed, with `scores` and `eligible` lists"] };
   }
@@ -22482,7 +22646,7 @@ function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = 
   const unknown = [...byId.keys()].filter((id) => !eligibleIds.includes(id));
   if (unknown.length > 0) problems.push(`verdict for ${unknown.join(", ")}, which is not eligible`);
   if (problems.length > 0) return { ok: false, problems };
-  const summary2 = { confirmed: [], held: [], moved: [] };
+  const summary2 = { confirmed: [], held: [], moved: [], answered: [] };
   const held = [];
   const holdReasons = /* @__PURE__ */ new Map();
   const hold = (finding, id, verdict2, reason2) => {
@@ -22506,7 +22670,7 @@ function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = 
     const id = idOf2(entry);
     const verdict2 = id === null ? void 0 : byId.get(id);
     if (verdict2 === void 0) return entry;
-    const { candidate_id: _id, ...cited } = verdict2;
+    const { candidate_id: _id, decisive_quotes: _quotes, answered: _answered, ...cited } = verdict2;
     const rest = { ...cited, decisive_evidence: withoutReproductionFiles(cited.decisive_evidence, reproductions) };
     const heldAs = holdReasons.get(id);
     return heldAs === void 0 ? { ...entry, challenge: rest } : { ...entry, challenge: rest, eligible: false, rejectedBecause: `${heldAs.verdict}: ${heldAs.reason}` };
@@ -22516,6 +22680,14 @@ function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = 
     const verdict2 = byId.get(id);
     if (verdict2.verdict === "partly") hold(finding, id, "challenge-partly", verdict2.reason);
     else if (verdict2.verdict === "refuted") hold(finding, id, "challenge-refuted", verdict2.reason);
+    else if (readHead3 !== null) {
+      const causedBy = isRecord4(finding["causedBy"]) ? finding["causedBy"]["path"] : void 0;
+      const touched = [String(finding["path"]), ...typeof causedBy === "string" ? [causedBy] : [], ...hunks.keys()];
+      const citable = new Set(withoutReproductionFiles(verdict2.decisive_evidence, reproductions));
+      const checked = checkDecisive(verdict2, readHead3, touched, (entry) => !citable.has(entry));
+      if ("problem" in checked) hold(finding, id, "challenge-partly", `decisive evidence refused: ${checked.problem}`);
+      else verdict2.decisive_evidence = checked.evidence;
+    }
   }
   let document = {
     ...scores,
@@ -22525,7 +22697,7 @@ function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = 
   for (const finding of eligible) {
     const id = idOf2(finding);
     const verdict2 = byId.get(id);
-    if (verdict2.verdict !== "confirmed") continue;
+    if (verdict2.verdict !== "confirmed" || holdReasons.has(id)) continue;
     if (verdict2.corrected_line === void 0) {
       summary2.confirmed.push(id);
       continue;
@@ -22546,6 +22718,17 @@ function applyChallenge(scores, candidates, rawVerdicts, hunks, reproductions = 
       eligible: document["eligible"].filter((e) => !(isRecord4(e) && idOf2(e) === id))
     };
   }
+  const ownerAsked = new Set(scores["scores"].filter((e) => isRecord4(e) && e["ownerQuestion"] === true).map((e) => idOf2(e)));
+  const answers = /* @__PURE__ */ new Map();
+  for (const finding of eligible) {
+    const id = idOf2(finding);
+    const verdict2 = byId.get(id);
+    if (verdict2.answered === true && finding["severity"] === "question" && !holdReasons.has(id) && !ownerAsked.has(id)) {
+      answers.set(id, verdict2.reason);
+      summary2.answered.push(id);
+    }
+  }
+  document = stateAnswered(document, answers);
   const order = new Map(eligibleIds.map((id, index) => [id, index]));
   const rank2 = (id) => order.get(id ?? "") ?? 0;
   held.sort((a, b) => rank2(a.candidateId) - rank2(b.candidateId));
@@ -23081,7 +23264,7 @@ var STAGES = [
 // plugins/review-voice/src/review/config.ts
 import { execFileSync as execFileSync11 } from "node:child_process";
 import { existsSync as existsSync10, rmSync as rmSync6, writeFileSync as writeFileSync6 } from "node:fs";
-import { isAbsolute as isAbsolute4, join as join17, resolve as resolve4 } from "node:path";
+import { isAbsolute as isAbsolute5, join as join17, resolve as resolve4 } from "node:path";
 
 // plugins/review-voice/src/diff/pull-request.ts
 import { execFileSync as execFileSync10 } from "node:child_process";
@@ -23428,11 +23611,13 @@ function resolveTrustedConfig(pull, notes) {
   }
   const environment = process.env["REVIEW_VOICE_CONFIG"];
   if (environment !== void 0 && environment !== "") {
-    if (isAbsolute4(environment)) return { source: { kind: "env", path: environment }, stated: environmentSource() };
+    if (isAbsolute5(environment)) return { source: { kind: "env", path: environment }, stated: environmentSource() };
     notes.push("REVIEW_VOICE_CONFIG must be an absolute path, so it was ignored and the base commit supplied the configuration.");
   }
   const { sha, ref } = pull.base;
-  if (sha === null) return `GitHub returned no base commit for ${pull.repository}#${pull.pullNumber}, so there is no trusted configuration to read.`;
+  if (sha === null) {
+    return pull.pullNumber === null ? `No base commit is known for ${pull.repository}, so there is no trusted configuration to read.` : `GitHub returned no base commit for ${pull.repository}#${pull.pullNumber}, so there is no trusted configuration to read.`;
+  }
   const path = join17(pull.dir, "config.yaml");
   rmSync6(path, { force: true });
   let from = sha;
@@ -23498,7 +23683,27 @@ async function must(run, argv, stdin, code3 = 2) {
   if (result.code !== 0) throw new Stop(code3, `${argv[0]} exited ${result.code}: ${firstLines(result.stderr)}`);
   return result;
 }
+function localGit(args) {
+  return execFileSync12("git", [...SAFE_GIT, ...args], { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+function localHead(ref) {
+  let sha;
+  let baseSha;
+  try {
+    sha = localGit(["rev-parse", "--verify", "HEAD^{commit}"]);
+    baseSha = localGit(["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
+  } catch {
+    throw new Stop(2, `--base ${ref} does not resolve to a commit in this checkout, or HEAD does not.`);
+  }
+  let mergeBase = null;
+  try {
+    mergeBase = localGit(["merge-base", baseSha, sha]) || null;
+  } catch {
+  }
+  return { sha, base: { sha: mergeBase ?? baseSha, ref }, author: null };
+}
 async function headOf(run) {
+  if (run.options.base != null) return localHead(run.options.base);
   const { repository, pullNumber } = run.options;
   const { data } = await run.deps.client.get(
     `/repos/${repository}/pulls/${pullNumber}`
@@ -23600,7 +23805,8 @@ var withoutCounts = (output) => {
   return rest;
 };
 function runDirectory(options, head) {
-  const name = `${options.repository.replace("/", "-")}-${options.pullNumber}-${head.slice(0, 8)}`;
+  const target = options.pullNumber === null ? `base-${(options.base ?? "").replace(/[^\w.-]+/g, "_")}` : String(options.pullNumber);
+  const name = `${options.repository.replace("/", "-")}-${target}-${head.slice(0, 8)}`;
   const base = join18(dataDirectory(), "runs", name);
   let dir = base;
   for (let n = 2; existsSync11(dir); n += 1) dir = `${base}-${n}`;
@@ -23609,14 +23815,18 @@ function runDirectory(options, head) {
 async function prep(run) {
   const { repository, pullNumber } = run.options;
   const pr = ["--pr", String(pullNumber), "--repository", repository];
-  const diff = await must(run, [
-    "diff",
-    ...pr,
-    "--out",
-    run.dir,
-    ...run.options.since === null ? [] : ["--since", run.options.since],
-    ...run.options.full ? ["--full"] : []
-  ]);
+  const branch = run.options.base != null;
+  const diff = await must(
+    run,
+    branch ? ["diff", "--base", run.options.base, "--out", run.dir] : [
+      "diff",
+      ...pr,
+      "--out",
+      run.dir,
+      ...run.options.since === null ? [] : ["--since", run.options.since],
+      ...run.options.full ? ["--full"] : []
+    ]
+  );
   run.summary = parsed(diff.stdout)["summary"];
   if (!isRecord5(run.summary)) throw new Stop(2, "diff printed no summary.");
   if (run.summary["head"] !== run.head) throw new Stop(3, `The head moved to ${String(run.summary["head"])} while the diff was read.`);
@@ -23631,7 +23841,8 @@ async function prep(run) {
     const note = isRecord5(run.summary[key2]) ? run.summary[key2]["note"] : null;
     if (typeof note === "string") run.notes.push(note);
   }
-  await must(run, ["thread", ...pr, "--out", at(run, "thread.json")]);
+  if (branch) writeJson(at(run, "thread.json"), { repository, pullNumber: null, comments: [], reviews: [] });
+  else await must(run, ["thread", ...pr, "--out", at(run, "thread.json")]);
   writeFileSync7(at(run, "context.json"), (await must(run, ["context"])).stdout);
   if (noCommands(run)) {
     run.notes.push("REVIEW_VOICE_NO_COMMANDS=1, so the static evidence commands were not run.");
@@ -23668,7 +23879,7 @@ async function prep(run) {
     "--out",
     at(run, "symbols.json")
   ]);
-  const followUps = (await must(run, ["follow-ups", ...pr])).stdout;
+  const followUps = branch ? JSON.stringify({ followUps: [] }) : (await must(run, ["follow-ups", ...pr])).stdout;
   writeFileSync7(at(run, "follow-ups.json"), followUps);
   run.followUps = list2(parsed(followUps)["followUps"]).length > 0;
   writeJson(at(run, "authorship.json"), authorshipOf(run));
@@ -24094,8 +24305,7 @@ async function score(run) {
     run.head,
     "--thread",
     at(run, "thread.json"),
-    "--exclude-pull",
-    String(run.options.pullNumber)
+    ...run.options.pullNumber === null ? [] : ["--exclude-pull", String(run.options.pullNumber)]
   ];
   const input = JSON.stringify({ candidates });
   writeFileSync7(at(run, "score-input.json"), input);
@@ -24171,7 +24381,14 @@ async function challenge(run) {
   const emitted = parsed(
     (await must(
       run,
-      ["challenge", ...base, "--emit-prompts", ...run.intent ? ["--intent", at(run, "intent.json")] : []],
+      [
+        "challenge",
+        ...base,
+        "--emit-prompts",
+        ...run.head === "" ? [] : ["--head", run.head],
+        ...run.headDir === null ? [] : ["--cwd", run.headDir],
+        ...run.intent ? ["--intent", at(run, "intent.json")] : []
+      ],
       void 0,
       1
     )).stdout
@@ -24207,7 +24424,8 @@ async function challenge(run) {
     (result, index) => result.ok ? list2(result.output["verdicts"])[0] : { candidate_id: idOf3(challenged[index]), verdict: "partly", line_ok: true, decisive_evidence: [], reason: why(result.error) }
   );
   writeJson(at(run, "challenge-verdicts.json"), { verdicts });
-  await must(run, ["challenge", ...base, "--out", out], JSON.stringify({ verdicts }), 1);
+  const inHead = run.headDir === null ? [] : ["--cwd", run.headDir];
+  await must(run, ["challenge", ...base, ...inHead, "--out", out], JSON.stringify({ verdicts }), 1);
   const document = parsed(readFileSync13(out, "utf8"));
   if (challenged.length < eligible.length) {
     const after = new Map(list2(document["eligible"]).map((entry) => [idOf3(entry), entry]));
@@ -24298,8 +24516,8 @@ async function record2(run, extra) {
       at(run, "diff.patch"),
       "--files",
       at(run, "files.json"),
-      "--thread",
-      at(run, "thread.json"),
+      // A branch review's thread is empty and names no pull request.
+      ...run.options.pullNumber === null ? [] : ["--thread", at(run, "thread.json")],
       "--held",
       at(run, "held.json"),
       "--stages",
@@ -24329,6 +24547,10 @@ async function record2(run, extra) {
   if (isRecord5(context2) && context2["heldQueue"] === true && !run.carried) {
     const actions = (run.deps.env ?? process.env)["GITHUB_ACTIONS"] === "true";
     run.heldQueue = heldQueue(run.held, actions ? null : run.promoteCall);
+  }
+  if (run.options.pullNumber === null) {
+    skip(run, "verdict", "no pull request");
+    return skip(run, "post", "no pull request");
   }
   const target = ["--repository", run.options.repository, "--pr", String(run.options.pullNumber), "--head", run.head, "--run", run.runId ?? ""];
   const verdict2 = await cli(run, ["verdict", ...target], run.text ?? "");
@@ -24462,10 +24684,12 @@ function auditFailure(run, failure) {
   try {
     const db = openDatabase();
     try {
-      const { repository, pullNumber } = run.options;
-      recordAudit(db, "review_failed", { type: "pull_request", id: `${repository.toLowerCase()}#${pullNumber}` }, {
+      const { repository, pullNumber, base } = run.options;
+      const subject = pullNumber === null ? { type: "branch", id: `${repository.toLowerCase()}@${base ?? ""}` } : { type: "pull_request", id: `${repository.toLowerCase()}#${pullNumber}` };
+      recordAudit(db, "review_failed", subject, {
         repository,
         pull: pullNumber,
+        ...pullNumber === null ? { base } : {},
         head: run.head === "" ? null : run.head,
         code: failure.code,
         stage: failure.stage,
@@ -24856,9 +25080,16 @@ function verificationProblem(list3) {
     if (impactClass !== void 0 && !isImpactClass(impactClass)) {
       return `${who}: impact_class must be one of ${IMPACT_CLASSES.join(", ")}, not ${JSON.stringify(impactClass)}.`;
     }
+    const alsoAt = entry["also_at"] ?? entry["alsoAt"];
+    if (alsoAt !== void 0 && !(Array.isArray(alsoAt) && alsoAt.length <= 10 && alsoAt.every((ref) => typeof ref === "string" && /^\S(?:.*\S)?:\d+(?:-\d+)?$/.test(ref)))) {
+      return `${who}: also_at must be a list of at most 10 "path:line" references.`;
+    }
     const missing = entry["required_context_missing"] ?? entry["requiredContextMissing"];
     if (missing !== void 0 && !(Array.isArray(missing) && missing.every(isMissingContext))) {
-      return `${who}: required_context_missing must be an array of strings, or of {"context": string, "kind": ${CONTEXT_KINDS.map((kind) => `"${kind}"`).join(" | ")}}.`;
+      const index2 = Array.isArray(missing) ? missing.findIndex((item2) => !isMissingContext(item2)) : -1;
+      const item = index2 === -1 ? void 0 : missing[index2];
+      const why = index2 === -1 ? "it is not an array" : typeof item !== "object" || item === null || Array.isArray(item) ? `entry ${index2} is ${JSON.stringify(item)}, neither a string nor an object` : Object.keys(item).find((key2) => key2 !== "context" && key2 !== "kind") !== void 0 ? `entry ${index2} has the key ${JSON.stringify(Object.keys(item).find((key2) => key2 !== "context" && key2 !== "kind"))}` : typeof item["context"] !== "string" || item["context"] === "" ? `entry ${index2} has no non-empty "context" string` : `entry ${index2} has kind ${JSON.stringify(item["kind"])}`;
+      return `${who}: required_context_missing must be an array of strings, or of {"context": string, "kind"?: ${CONTEXT_KINDS.map((kind) => `"${kind}"`).join(" | ")}} objects with no other key; ${why}. Example: ["the deployed orders schema", {"context": "the display text of checkout.title", "kind": "cosmetic"}].`;
     }
     const partly = entry["partly_addressed"] ?? entry["partlyAddressed"];
     const partlyProblem = partly === void 0 ? null : partlyAddressedProblem(partly);
@@ -25278,9 +25509,21 @@ var STOPWORDS = /* @__PURE__ */ new Set([
   "used"
 ]);
 var EXCERPT_CHARS = 220;
+function scopeClause(query) {
+  if (query.allowlist === void 0) return { sql: "", params: [] };
+  const exact = query.allowlist.filter((entry) => !entry.endsWith("/*"));
+  if (query.repository !== void 0) exact.push(query.repository);
+  const owners = query.allowlist.filter((entry) => entry.endsWith("/*")).map((entry) => `${entry.slice(0, -1).replace(/[\\%_]/g, "\\$&")}%`);
+  const clauses = [
+    ...exact.length === 0 ? [] : [`e.repository COLLATE NOCASE IN (${exact.map(() => "?").join(", ")})`],
+    ...owners.map(() => "e.repository LIKE ? ESCAPE '\\'")
+  ];
+  return { sql: `AND (${clauses.length === 0 ? "0" : clauses.join(" OR ")})`, params: [...exact, ...owners] };
+}
 function retrievePrecedents(db, query) {
   const match = toMatchQuery(query.text);
   if (match.length === 0) return [];
+  const scope = scopeClause(query);
   let rows;
   try {
     rows = db.prepare(
@@ -25295,6 +25538,7 @@ function retrievePrecedents(db, query) {
          WHERE review_events_fts MATCH ?
            AND (? IS NULL OR e.pull_number IS NULL OR e.pull_number != ?
                 OR (? IS NOT NULL AND e.repository != ?))
+           ${scope.sql}
          ORDER BY rank
          LIMIT 200`
     ).all(
@@ -25302,7 +25546,8 @@ function retrievePrecedents(db, query) {
       query.excludePullNumber ?? null,
       query.excludePullNumber ?? null,
       query.repository ?? null,
-      query.repository ?? null
+      query.repository ?? null,
+      ...scope.params
     );
   } catch {
     return [];
@@ -25389,6 +25634,7 @@ function retrieveCommand(argv) {
     const precedents = retrievePrecedents(db, {
       text: text5,
       repository: flag(argv, "--repository") ?? void 0,
+      allowlist: repositoryConfig()?.allowlist,
       filePath: flag(argv, "--path") ?? void 0,
       language: flag(argv, "--language") ?? void 0,
       maxPositive: numericFlag(argv, "--max-positive", 3) ?? 3,
@@ -25529,7 +25775,7 @@ function anchorsCommand(argv) {
 
 // plugins/review-voice/src/cli/context.ts
 import { existsSync as existsSync14 } from "node:fs";
-import { join as join21 } from "node:path";
+import { basename as basename6, join as join21 } from "node:path";
 
 // plugins/review-voice/src/policy/schema.ts
 function resolvePolicy(layers) {
@@ -25588,12 +25834,19 @@ function contextCommand() {
     }
     const configPath = join21(root, ".review-voice", "config.yaml");
     const policy = resolvePolicy(config2.layers);
+    const notSetUp = config2.ownerReviewer === null && config2.allowlist.length === 0 ? "Review Voice is not set up for this repository: its configuration names no identity.owner_reviewer and no repositories.include. Run /review-voice:init. Until then the review is scored without review history from any other repository." : null;
     console.log(
       JSON.stringify(
         {
           repositoryRoot: root,
+          // The Claude Code version of the session running this review, for
+          // `record --claude-version`, which has no other way to learn it
+          // (#386). Claude Code names its versioned binary in this variable;
+          // null when it is unset or is not a version.
+          claudeCodeVersion: /^\d+\.\d+\.\d+[\w.-]*$/.exec(basename6(process.env["CLAUDE_CODE_EXECPATH"] ?? ""))?.[0] ?? null,
           ownerReviewer: config2.ownerReviewer,
           allowlist: config2.allowlist,
+          notSetUp,
           staticEvidence: config2.staticEvidence,
           // The driver reads the runners from context.json, as it reads the configured check names.
           reproduction: { enabled: config2.reproduction.enabled, runners: config2.reproduction.runners },
@@ -25602,6 +25855,9 @@ function contextCommand() {
           // The review command needs the structural opt-ins after resolving
           // config, including the optional simplification pass.
           structure: config2.structure,
+          // Which analyst lanes are configured, so a review can see that only
+          // the diff lane runs unless review.lanes adds one (#378).
+          lanes: config2.lanes.map((lane) => ({ name: lane.name, agent: lane.agent, prefix: lane.prefix, when: lane.when })),
           // Reported whether or not it is configured. A config written before
           // second-pass verification existed has no `verification:` block at
           // all, so an upgrading user silently got none of it and nothing in
@@ -25701,7 +25957,7 @@ function wordsOf(text5) {
   return new Set(prose.toLowerCase().match(WORD) ?? []);
 }
 function backingText(entry) {
-  const parts = [entry["claim"], entry["failureMode"], entry["failure_mode"]];
+  const parts = [entry["claim"], entry["failureMode"], entry["failure_mode"], entry["challengeAnswer"]];
   const evidence = entry["evidence"];
   if (Array.isArray(evidence)) parts.push(...evidence);
   const fix = entry["fix"];
@@ -25748,8 +26004,10 @@ function validateOutputCommand(argv) {
     ...DEFAULT_LIMITS,
     maxFindings: argv.includes("--max-findings") ? maxFindings : null,
     maxWordsPerFinding: maxWords,
-    maxTotalWords: Math.max(scaledTotal, maxTotal === DEFAULT_LIMITS.maxTotalWords ? scaledTotal : maxTotal)
+    // The larger of the two: scaling never falls under the floor, which is the default.
+    maxTotalWords: Math.max(scaledTotal, maxTotal)
   };
+  const scaledNote = argv.includes("--max-total-words") && limits.maxTotalWords !== maxTotal ? ` (--max-total-words ${maxTotal}, scaled to ${scaleTo} file${scaleTo === 1 ? "" : "s"})` : "";
   const output = readStdin();
   const result = validateOutput(output, limits);
   const scoresFlag = flag(argv, "--scores");
@@ -25775,7 +26033,7 @@ function validateOutputCommand(argv) {
   }
   if (result.valid) {
     console.log(
-      `Contract satisfied: ${result.findingCount} finding(s), ${result.totalWords}/${limits.maxTotalWords} words.`
+      `Contract satisfied: ${result.findingCount} finding(s), ${result.totalWords}/${limits.maxTotalWords} words${scaledNote}.`
     );
     return 0;
   }
@@ -25784,7 +26042,7 @@ function validateOutputCommand(argv) {
     console.error(`[${violation.code}] ${where}${violation.message}`);
   }
   console.error(`
-${result.violations.length} contract violation(s).`);
+${result.violations.length} contract violation(s).${scaledNote === "" ? "" : ` Total word limit ${limits.maxTotalWords}${scaledNote}.`}`);
   return 1;
 }
 
@@ -25965,14 +26223,14 @@ function followUpsCommand(argv) {
 }
 
 // plugins/review-voice/src/consent/purge.ts
-function scopeClause(scope) {
+function scopeClause2(scope) {
   if (scope.all === true) return { where: "1=1", params: [] };
   if (scope.repository !== void 0) return { where: "repository = ?", params: [scope.repository] };
   if (scope.before !== void 0) return { where: "created_at < ?", params: [scope.before] };
   return { where: "1=0", params: [] };
 }
 function previewPurge(db, scope) {
-  const { where, params } = scopeClause(scope);
+  const { where, params } = scopeClause2(scope);
   const events = db.prepare(`SELECT COUNT(*) AS n FROM review_events WHERE ${where}`).get(...params).n;
   const byRepository = Object.fromEntries(
     db.prepare(`SELECT repository, COUNT(*) AS n FROM review_events WHERE ${where} GROUP BY repository`).all(...params).map((row) => [row.repository, row.n])
@@ -25986,7 +26244,7 @@ function previewPurge(db, scope) {
 }
 function executePurge(db, scope, runDirectories) {
   const preview = previewPurge(db, scope);
-  const { where, params } = scopeClause(scope);
+  const { where, params } = scopeClause2(scope);
   db.exec("BEGIN");
   try {
     db.prepare(`DELETE FROM review_events WHERE ${where}`).run(...params);
@@ -26711,6 +26969,11 @@ var RULE_DIRECTORIES = [
   { path: join23(".agents", "rules"), kind: "rule" },
   { path: join23(".claude", "rules"), kind: "rule" }
 ];
+var SEARCHED_PLACES = [
+  ...REPOSITORY_FILES.map((file2) => file2.path),
+  ...NESTED_FILES.map((file2) => `<directory the change touches>/${file2.name}`),
+  ...RULE_DIRECTORIES.map((directory) => `<any directory>/${directory.path}/`)
+];
 var TOTAL_BYTES = 6e4;
 var PER_DOCUMENT_SHARE = 0.25;
 var PER_DOCUMENT_BYTES = Math.floor(TOTAL_BYTES * PER_DOCUMENT_SHARE);
@@ -27127,10 +27390,14 @@ function conventionsCommand(argv) {
     return 2;
   }
   const report = discoverConventions(root, changed, ref === null ? void 0 : gitTreeReader(root, ref));
+  if (report.documents.length === 0 && report.skipped.length === 0) {
+    console.error(`No convention documents found${ref === null ? "" : ` at ${ref}`}. Looked for: ${SEARCHED_PLACES.join(", ")}.`);
+  }
   console.log(
     JSON.stringify(
       {
         ...report,
+        searched: SEARCHED_PLACES,
         // Restated on the payload itself, because this is the one command
         // whose output is repository-authored text going into a prompt.
         trust: "evidence",
@@ -27186,7 +27453,7 @@ function checkIntentCommand(argv) {
 
 // plugins/review-voice/src/cli/recall.ts
 import { writeFileSync as writeFileSync11, mkdirSync as mkdirSync10, statSync as statSync8, lstatSync as lstatSync5, renameSync as renameSync3, rmSync as rmSync10, existsSync as existsSync18 } from "node:fs";
-import { dirname as dirname16, isAbsolute as isAbsolute5, relative as relative4, resolve as resolve10, sep as sep5 } from "node:path";
+import { dirname as dirname16, isAbsolute as isAbsolute6, relative as relative4, resolve as resolve10, sep as sep5 } from "node:path";
 
 // plugins/review-voice/src/evaluate/recall.ts
 import { execFileSync as execFileSync16 } from "node:child_process";
@@ -27207,7 +27474,7 @@ import {
   writeFileSync as writeFileSync10
 } from "node:fs";
 import { tmpdir as tmpdir3 } from "node:os";
-import { basename as basename6, dirname as dirname15, join as join24, relative as relative3, resolve as resolve8, sep as sep4 } from "node:path";
+import { basename as basename7, dirname as dirname15, join as join24, relative as relative3, resolve as resolve8, sep as sep4 } from "node:path";
 var AUTHOR_NAME = "review-voice-fixtures";
 var AUTHOR_EMAIL = "fixtures@example.com";
 var COMMIT_DATE = "2026-01-01T00:00:00Z";
@@ -27355,7 +27622,7 @@ function patchMoves(normalised2) {
   return moves;
 }
 function fillerFor(path) {
-  const extension = basename6(path).includes(".") ? basename6(path).split(".").pop().toLowerCase() : "";
+  const extension = basename7(path).includes(".") ? basename7(path).split(".").pop().toLowerCase() : "";
   const hash2 = ["yml", "yaml", "tf", "py", "rb", "sh", "toml", "ini", "cfg", "conf", "md", "txt"];
   return hash2.includes(extension) ? "# filler" : "// filler";
 }
@@ -27458,7 +27725,7 @@ function git3(cwd, label2, args) {
   }
 }
 function materializeFixture(fixtureDir, targetDir, options = {}) {
-  const label2 = options.name ?? `${basename6(dirname15(resolve8(fixtureDir)))}/${basename6(resolve8(fixtureDir))}`;
+  const label2 = options.name ?? `${basename7(dirname15(resolve8(fixtureDir)))}/${basename7(resolve8(fixtureDir))}`;
   const patchPath2 = join24(fixtureDir, "diff.patch");
   if (!existsSync16(patchPath2)) throw new Error(`${label2}: fixture has no diff.patch`);
   if (existsSync16(targetDir) && readdirSync5(targetDir).length > 0) {
@@ -27945,7 +28212,7 @@ async function recallCommand(argv, runInProcess2) {
     return 2;
   }
   const inside2 = relative4(realExistingPath(resolve10(fixtures)), realExistingPath(out));
-  const outside = inside2 === ".." || inside2.startsWith(`..${sep5}`) || isAbsolute5(inside2);
+  const outside = inside2 === ".." || inside2.startsWith(`..${sep5}`) || isAbsolute6(inside2);
   if (!outside) {
     console.error(`--out ${out} is inside the fixtures; recall never writes there.`);
     return 2;
@@ -28489,7 +28756,7 @@ function worktreeCommand(argv) {
 // plugins/review-voice/src/cli/config.ts
 import { createHash as createHash8 } from "node:crypto";
 import { existsSync as existsSync20, lstatSync as lstatSync9, mkdirSync as mkdirSync13, readFileSync as readFileSync26, realpathSync as realpathSync4, rmSync as rmSync14, statSync as statSync11, writeFileSync as writeFileSync13 } from "node:fs";
-import { dirname as dirname18, isAbsolute as isAbsolute6, join as join29, resolve as resolve13 } from "node:path";
+import { dirname as dirname18, isAbsolute as isAbsolute7, join as join29, resolve as resolve13 } from "node:path";
 async function configCommand(argv) {
   const dir = flag(argv, "--dir");
   if (argv[0] !== "resolve" || dir === null) {
@@ -28569,7 +28836,7 @@ function withTrustedConfig(argv) {
   }
   const known = CONFIG_SOURCES.find((kind) => kind === source);
   if (known === void 0) return `--trusted-config: ${file2} names the source ${source}, which is not one of ${CONFIG_SOURCES.join(", ")}.`;
-  if (!isAbsolute6(path)) return `--trusted-config: ${file2} names the path ${path}, which is not absolute.`;
+  if (!isAbsolute7(path)) return `--trusted-config: ${file2} names the path ${path}, which is not absolute.`;
   const entry = lstatSync9(path, { throwIfNoEntry: false });
   if (entry?.isSymbolicLink() === true || realDirectory(dirname18(path)) !== dirname18(path)) {
     return `--trusted-config: ${file2} names the path ${path}, which is a symbolic link, runs through one, or lies in no directory.`;
@@ -29175,10 +29442,14 @@ function isPath(symbol) {
 var LOOSE_ABSENCE = [
   /\b(?:does|do|did)\s*(?:not|n't)\s+exist|\bmissing\b|\babsent\b|\b(?:deleted|removed)\b|\bnot\s+(?:found|present)\b/i
 ];
-var CLAUSE_BREAK = /[.;!?](?=\s|$)|\b(?:which|that|who|but|whereas|while)\b/gi;
+var CLAUSE_WORDS = "which|that|who|but|whereas|while|when|whenever|if|unless|because";
+var CLAUSE_BREAK = new RegExp(`[.;!?](?=\\s|$)|\\b(?:${CLAUSE_WORDS})\\b`, "gi");
+var CLAUSE_OPENER = new RegExp(`^\\s*(?:${CLAUSE_WORDS})\\b`, "i");
+var PRONOUN_SUBJECT = /\b(?:both|they|them|it|neither|none|these|those|all|each|either)\b/i;
+var ADJACENT = /^\W*(?:\w+\W*)?$/;
 function tiedToAbsence(text5, symbols) {
   const strict = tiedBy(ASSERTS_ABSENCE, text5, symbols);
-  return strict.size > 0 ? strict : tiedBy(LOOSE_ABSENCE, text5, symbols);
+  return strict === null || strict.size > 0 ? strict : tiedBy(LOOSE_ABSENCE, text5, symbols);
 }
 function tiedBy(phrases, text5, symbols) {
   const masked = text5.replace(/`[^`]*`/g, (span) => `\`${"x".repeat(span.length - 2)}\``);
@@ -29195,25 +29466,35 @@ function tiedBy(phrases, text5, symbols) {
     return at2;
   });
   const tied = /* @__PURE__ */ new Set();
+  let unnamed = false;
+  let unsettled = false;
   for (let i = 0; i + 1 < starts.length; i += 1) {
     const start = starts[i] ?? 0;
     const end = starts[i + 1] ?? text5.length;
     const clause = masked.slice(start, end);
-    if (!phrases.some((phrase) => phrase.test(clause))) continue;
-    const inClause = occurrences.filter(({ index }) => index >= start && index < end);
-    if (inClause.length > 0) {
-      for (const { symbol } of inClause) tied.add(symbol);
-    } else if (/^\s*(?:which|that|who)\b/i.test(clause)) {
-      let antecedent;
-      for (const occurrence of occurrences) {
-        if (occurrence.index < start && (antecedent === void 0 || occurrence.index > antecedent.index)) {
-          antecedent = occurrence;
-        }
-      }
+    const phrase = phrases.map((pattern) => pattern.exec(clause)).find((match) => match !== null);
+    if (phrase === void 0 || phrase === null) continue;
+    const at2 = start + phrase.index;
+    const follows = /^no\s+such/i.test(phrase[0]);
+    const subjects = occurrences.filter(
+      ({ index }) => index >= start && index < end && (follows ? index > at2 : index < at2)
+    );
+    const lead = clause.slice(0, phrase.index).replace(CLAUSE_OPENER, "");
+    if (subjects.length > 0) {
+      for (const { symbol } of subjects) tied.add(symbol);
+    } else if (!follows && /^\s*(?:which|that|who)\b/i.test(clause)) {
+      const antecedent = occurrences.find(
+        ({ symbol, index }) => index < start && ADJACENT.test(masked.slice(index + symbol.length, start))
+      );
       if (antecedent !== void 0) tied.add(antecedent.symbol);
+      else unnamed = true;
+    } else if (follows || !/\w/.test(lead) || PRONOUN_SUBJECT.test(lead)) {
+      unsettled = true;
+    } else {
+      unnamed = true;
     }
   }
-  return tied;
+  return tied.size === 0 && unnamed && !unsettled ? null : tied;
 }
 function generatedAccessor(symbol) {
   return !FILE_NAME.test(symbol) && GENERATED_ACCESSOR.some((shape) => shape.test(symbol));
@@ -29238,7 +29519,8 @@ function checkAbsenceClaim(text5, cwd, ref = null, search = gitGrep, repository 
     (symbol) => text5.split(symbol).slice(0, -1).some((before) => !before.endsWith("/"))
   );
   const tied = tiedToAbsence(text5, stated);
-  const symbols = stated.filter((symbol) => !isPath(symbol) || tied.size === 0 || tied.has(symbol));
+  if (tied === null) return null;
+  const symbols = stated.filter((symbol) => tied.size === 0 || tied.has(symbol));
   if (symbols.length === 0) return null;
   const searchedRef = ref ?? "working tree";
   const found2 = [];
@@ -29480,6 +29762,13 @@ function symbolsFromHunks(diff, changedPath) {
   }
   return [...found2];
 }
+function diffTouches(diff, path) {
+  const wanted = normalisePath3(path);
+  for (const match of diff.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)) {
+    if (normalisePath3(match[1]) === wanted || normalisePath3(match[2]) === wanted) return true;
+  }
+  return false;
+}
 var REPOSITORY_WIDE_TOOLCHAIN_PATHS = [
   /(?:^|\/)(?:eslint\.config\.[^/]+|\.eslintrc(?:\.[^/]+)?|biome\.json|\.stylelintrc(?:\.[^/]+)?|\.prettierrc(?:\.[^/]+)?)$/i,
   /(?:^|\/)tsconfig(?:\.[^/]+)?\.json$/i,
@@ -29547,8 +29836,9 @@ function computeReach(text5, changedPath, cwd, ref = null, search = gitGrepPaths
   const isCodePath = (path) => isCode(path, firstParty);
   const searchedRef = ref ?? "working tree";
   const ownHunks = diff === null ? [] : symbolsFromHunks(diff, changedPath);
-  const anyHunks = diff === null || ownHunks.length > 0 ? [] : symbolsFromHunks(diff, null);
-  const source = ownHunks.length > 0 ? "hunks" : anyHunks.length > 0 ? "diff" : "claim";
+  const inDiff = diff !== null && diffTouches(diff, changedPath);
+  const anyHunks = diff === null || inDiff ? [] : symbolsFromHunks(diff, null);
+  const source = inDiff || ownHunks.length > 0 ? "hunks" : anyHunks.length > 0 ? "diff" : "claim";
   const symbols = (source === "hunks" ? ownHunks : source === "diff" ? anyHunks : namedSymbols(text5)).slice(0, 12);
   const searched = [];
   const ignored = [];
@@ -31049,11 +31339,26 @@ async function replyCommand(argv) {
 }
 
 // plugins/review-voice/src/cli/check-verification.ts
-import { readFileSync as readFileSync30 } from "node:fs";
+import { readFileSync as readFileSync30, writeFileSync as writeFileSync17 } from "node:fs";
 function keptCandidateIds(value) {
   const record3 = value;
   const list3 = Array.isArray(value) ? value : Array.isArray(record3?.kept) ? record3.kept : Array.isArray(record3?.candidates) ? record3.candidates : [];
   return list3.map((entry) => entry?.candidate_id).filter((id) => typeof id === "string");
+}
+function jsonInReply(text5) {
+  const fences = [...text5.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((match) => match[1]);
+  const spans = [
+    ["[", "]"],
+    ["{", "}"]
+  ].map(([open, close]) => [text5.indexOf(open), text5.lastIndexOf(close)]).filter(([from, to]) => from !== -1 && to > from).sort((a, b) => a[0] - b[0]).map(([from, to]) => text5.slice(from, to + 1));
+  for (const [index, candidate] of [text5, ...fences, ...spans].entries()) {
+    try {
+      return { value: JSON.parse(candidate), wrapped: index > 0 };
+    } catch {
+      continue;
+    }
+  }
+  return void 0;
 }
 function checkVerificationCommand(argv) {
   const candidatesFile = flag(argv, "--candidates");
@@ -31066,13 +31371,20 @@ function checkVerificationCommand(argv) {
       return 2;
     }
   }
-  let parsed2;
-  try {
-    parsed2 = JSON.parse(readStdin());
-  } catch {
-    console.error("Expected the evidence-verifier output as JSON on stdin.");
+  const outFile = flag(argv, "--out");
+  if (argv.includes("--out") && outFile === null) {
+    console.error("--out needs a file path.");
     return 2;
   }
+  const reply = jsonInReply(readStdin());
+  if (reply === void 0) {
+    console.error(
+      'Expected the evidence-verifier output as JSON on stdin: {"verifications": [...]}, or a bare array of the entries. Text or a code fence around the JSON is left out; no JSON was found in this reply.'
+    );
+    return 2;
+  }
+  const parsed2 = reply.value;
+  if (reply.wrapped) console.error("The reply had text around its JSON; only the JSON was read.");
   const list3 = verdictList(parsed2);
   if (list3.length === 0) {
     console.error(
@@ -31095,7 +31407,16 @@ function checkVerificationCommand(argv) {
       return 2;
     }
   }
-  console.log(JSON.stringify({ valid: true, verifications: list3.length }, null, 2));
+  if (outFile !== null) {
+    try {
+      writeFileSync17(outFile, `${JSON.stringify(parsed2, null, 2)}
+`);
+    } catch (error) {
+      console.error(`Cannot write ${outFile}: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
+  }
+  console.log(JSON.stringify({ valid: true, verifications: list3.length, ...outFile === null ? {} : { out: outFile } }, null, 2));
   return 0;
 }
 
@@ -31341,7 +31662,8 @@ function reconcileCommand(argv) {
 }
 
 // plugins/review-voice/src/cli/challenge.ts
-import { readFileSync as readFileSync33, writeFileSync as writeFileSync17 } from "node:fs";
+import { readFileSync as readFileSync33, writeFileSync as writeFileSync18 } from "node:fs";
+import { resolve as resolve15, sep as sep6 } from "node:path";
 function challengeCommand(argv) {
   const scoresFile = flag(argv, "--scores");
   const candidatesFile = flag(argv, "--candidates");
@@ -31352,13 +31674,13 @@ function challengeCommand(argv) {
   const outFile = flag(argv, "--out");
   if (scoresFile === null || candidatesFile === null || !emit && diffFile === null) {
     console.error(
-      "Usage: challenge --scores <file> --candidates <file> [--intent <file>] [--reproductions <file>] [--diff-file <patch>] --emit-prompts\n       challenge --scores <file> --candidates <file> --diff-file <patch> [--reproductions <file>] [--out <file>] < verdicts.json"
+      "Usage: challenge --scores <file> --candidates <file> [--intent <file>] [--reproductions <file>] [--diff-file <patch>] [--cwd <dir>] [--head <sha>] --emit-prompts\n       challenge --scores <file> --candidates <file> --diff-file <patch> [--reproductions <file>] [--cwd <dir>] [--out <file>] < verdicts.json"
     );
     return 2;
   }
-  for (const name of ["--intent", "--reproductions", "--diff-file", "--out"]) {
+  for (const name of ["--intent", "--reproductions", "--diff-file", "--out", "--cwd", "--head"]) {
     if (argv.includes(name) && flag(argv, name) === null) {
-      console.error(`${name} needs a file path.`);
+      console.error(`${name} needs a value.`);
       return 2;
     }
   }
@@ -31391,7 +31713,14 @@ function challengeCommand(argv) {
         return 2;
       }
     }
-    console.log(JSON.stringify({ prompts: challengePrompts(scores, candidates, statements, diffFile, reproductions) }, null, 2));
+    const cwd = flag(argv, "--cwd");
+    let dir = null;
+    try {
+      dir = cwd === null ? repositoryRoot(process.cwd()) : resolve15(cwd);
+    } catch {
+    }
+    const head = { dir, sha: flag(argv, "--head") };
+    console.log(JSON.stringify({ prompts: challengePrompts(scores, candidates, statements, diffFile, reproductions, head) }, null, 2));
     return 0;
   }
   let verdicts;
@@ -31408,7 +31737,18 @@ function challengeCommand(argv) {
     console.error("Cannot parse the challenger verdicts on stdin as JSON.");
     return 2;
   }
-  const result = applyChallenge(scores, candidates, verdicts, hunks, reproductions);
+  const headDir = flag(argv, "--cwd");
+  const root = headDir === null ? null : resolve15(headDir);
+  const readHead3 = root === null ? null : (path) => {
+    const file2 = resolve15(root, path);
+    if (!file2.startsWith(root + sep6)) return null;
+    try {
+      return readFileSync33(file2, "utf8").split("\n");
+    } catch {
+      return null;
+    }
+  };
+  const result = applyChallenge(scores, candidates, verdicts, hunks, reproductions, readHead3);
   if (!result.ok) {
     console.error("Challenge refused:");
     for (const problem of result.problems) console.error(`  ${problem}`);
@@ -31420,19 +31760,18 @@ function challengeCommand(argv) {
     process.stdout.write(terminalInert(body));
   } else {
     try {
-      writeFileSync17(outFile, body);
+      writeFileSync18(outFile, body);
     } catch (error) {
       console.error(`Cannot write ${outFile}: ${error instanceof Error ? error.message : String(error)}`);
       return 2;
     }
-    const { confirmed, held, moved } = result.summary;
-    console.log(JSON.stringify({ out: outFile, confirmed, held, moved }, null, 2));
+    console.log(JSON.stringify({ out: outFile, ...result.summary }, null, 2));
   }
   return 0;
 }
 
 // plugins/review-voice/src/cli/reanchor.ts
-import { readFileSync as readFileSync34, writeFileSync as writeFileSync18, renameSync as renameSync5, rmSync as rmSync15 } from "node:fs";
+import { readFileSync as readFileSync34, writeFileSync as writeFileSync19, renameSync as renameSync5, rmSync as rmSync15 } from "node:fs";
 function reanchorCommand(argv) {
   const candidateId = flag(argv, "--candidate");
   const line3 = Number(flag(argv, "--line"));
@@ -31479,11 +31818,11 @@ function reanchorCommand(argv) {
   try {
     if (candidatesFile !== null) {
       staged.push([`${candidatesFile}.reanchor-${process.pid}`, candidatesFile]);
-      writeFileSync18(staged[staged.length - 1][0], `${JSON.stringify(candidates, null, 2)}
+      writeFileSync19(staged[staged.length - 1][0], `${JSON.stringify(candidates, null, 2)}
 `);
     }
     staged.push([`${scoresFile}.reanchor-${process.pid}`, scoresFile]);
-    writeFileSync18(staged[staged.length - 1][0], `${JSON.stringify(result.updated, null, 2)}
+    writeFileSync19(staged[staged.length - 1][0], `${JSON.stringify(result.updated, null, 2)}
 `);
     for (const [temporary, target] of staged) renameSync5(temporary, target);
   } catch (error) {
@@ -31497,7 +31836,7 @@ function reanchorCommand(argv) {
 
 // plugins/review-voice/src/cli/agent.ts
 import { readFileSync as readFileSync35, statSync as statSync13 } from "node:fs";
-import { dirname as dirname19, resolve as resolve15 } from "node:path";
+import { dirname as dirname19, resolve as resolve16 } from "node:path";
 async function agentCommand(argv) {
   const name = flag(argv, "--name");
   const model = flag(argv, "--model");
@@ -31528,7 +31867,7 @@ async function agentCommand(argv) {
     console.error(`The schema ${schemaPath} must be a JSON object.`);
     return 2;
   }
-  const schemaDir = dirname19(resolve15(schemaPath));
+  const schemaDir = dirname19(resolve16(schemaPath));
   try {
     schemaForRunner(schema4, schemaDir);
   } catch (error) {
@@ -31953,7 +32292,7 @@ function statusCommand() {
 }
 
 // plugins/review-voice/src/cli/carry.ts
-import { readFileSync as readFileSync36, writeFileSync as writeFileSync19, mkdirSync as mkdirSync15 } from "node:fs";
+import { readFileSync as readFileSync36, writeFileSync as writeFileSync20, mkdirSync as mkdirSync15 } from "node:fs";
 import { dirname as dirname20, join as join31 } from "node:path";
 
 // plugins/review-voice/src/diff/held.ts
@@ -32372,19 +32711,19 @@ function carryCandidatesCommand(argv) {
   };
   try {
     mkdirSync15(outDir, { recursive: true });
-    writeFileSync19(
+    writeFileSync20(
       join31(outDir, "candidates.json"),
       `${JSON.stringify(candidatesIn.rebuild([...carriedCandidates, ...interdiffCandidates]), null, 2)}
 `
     );
-    writeFileSync19(
+    writeFileSync20(
       join31(outDir, "verification.json"),
       `${JSON.stringify(verificationIn.rebuild([...carriedVerification, ...interdiffVerification]), null, 2)}
 `
     );
-    if (heldIn !== null) writeFileSync19(join31(outDir, "held.json"), `${JSON.stringify(heldIn.rebuild(heldKept), null, 2)}
+    if (heldIn !== null) writeFileSync20(join31(outDir, "held.json"), `${JSON.stringify(heldIn.rebuild(heldKept), null, 2)}
 `);
-    writeFileSync19(join31(outDir, "carry.json"), `${JSON.stringify(record3, null, 2)}
+    writeFileSync20(join31(outDir, "carry.json"), `${JSON.stringify(record3, null, 2)}
 `);
   } catch (error) {
     console.error(`Cannot write to ${outDir}: ${error instanceof Error ? error.message : String(error)}`);
@@ -32432,7 +32771,7 @@ import { join as join32, posix as posix7 } from "node:path";
 
 // plugins/review-voice/src/cli/check-candidates.ts
 import { readFileSync as readFileSync38 } from "node:fs";
-import { isAbsolute as isAbsolute7, posix as posix6, relative as relative5 } from "node:path";
+import { isAbsolute as isAbsolute8, posix as posix6, relative as relative5 } from "node:path";
 
 // plugins/review-voice/src/cli/score.ts
 import { readFileSync as readFileSync37 } from "node:fs";
@@ -32728,6 +33067,8 @@ function scoreCommand(argv) {
           verified: typeof verified === "boolean" ? verified : void 0,
           blockerConfirmed: typeof blockerConfirmed === "boolean" ? blockerConfirmed : void 0,
           reason: typeof reason2 === "string" ? reason2 : void 0,
+          // Already checked by `verificationProblem`.
+          alsoAt: raw["also_at"] ?? raw["alsoAt"],
           requiredContextMissing: raw["required_context_missing"] ?? raw["requiredContextMissing"],
           // Already checked by `verificationProblem`.
           partlyAddressed: raw["partly_addressed"] ?? raw["partlyAddressed"]
@@ -32744,7 +33085,7 @@ function scoreCommand(argv) {
       return 2;
     }
     const known = new Set(candidates.map((candidate) => candidate.candidateId));
-    const unknown = [...verifications.keys()].filter((id) => !known.has(id));
+    const unknown = [...verifications].filter(([id, v]) => !known.has(id) && v.verified !== false).map(([id]) => id);
     if (unknown.length > 0) {
       console.error(`Warning: ${verificationFlag} verifies unknown candidate id(s): ${unknown.join(", ")}. Ignored.`);
     }
@@ -32839,6 +33180,7 @@ function scoreCommand(argv) {
       const precedents = retrievePrecedents(db, {
         text: `${candidate.claim} ${candidate.failureMode}`,
         repository: flag(argv, "--repository") ?? void 0,
+        allowlist: loadedConfig?.allowlist,
         filePath: candidate.path,
         // A comment on the pull request under review is the conversation, not
         // precedent, and it is the route by which a posted review comes back
@@ -33009,6 +33351,20 @@ function scoreCommand(argv) {
         rejectedBecause: r.rejectedBecause
       })
     );
+    const listed = new Set(
+      [...belowGate, ...suppressed, ...unverified, ...absenceContradicted].map((entry) => entry.candidateId)
+    );
+    const rejected = results.filter((r) => !r.eligible && !listed.has(r.candidateId)).map(
+      (r) => boundLists({
+        candidateId: r.candidateId,
+        path: r.path,
+        line: r.line,
+        severity: r.severity.severity,
+        claim: candidates.find((c) => c.candidateId === r.candidateId)?.claim ?? "",
+        verified: verifications.get(r.candidateId)?.verified === true,
+        rejectedBecause: r.rejectedBecause
+      })
+    );
     const scoreOf = new Map(results.map((r) => [r.candidateId, r]));
     const rank2 = (c) => {
       const scored = scoreOf.get(c.candidateId);
@@ -33097,13 +33453,17 @@ function scoreCommand(argv) {
               // A contested point is marked so the editor leaves it out: the
               // second pass disputed how far the failure reaches and no
               // tie-break upheld the wider claim.
-              ...c.impactDisputed === true ? { impactDisputed: true } : {}
+              ...c.impactDisputed === true ? { impactDisputed: true } : {},
+              // More instances of the same defect than the candidate listed.
+              // The verifier used to reject a true finding for them (#388).
+              ...(verifications.get(c.candidateId)?.alsoAt?.length ?? 0) > 0 ? { alsoAt: verifications.get(c.candidateId).alsoAt } : {}
             };
           }),
           belowGate: belowGate.map(withSnakeCaseId),
           suppressed: suppressed.map(withSnakeCaseId),
           unverified: unverified.map(withSnakeCaseId),
           absenceContradicted: absenceContradicted.map(withSnakeCaseId),
+          rejected: rejected.map(withSnakeCaseId),
           policyVersions
         },
         null,
@@ -33199,8 +33559,8 @@ function readSignals(file2, root) {
     const s = entry;
     if (typeof s !== "object" || s === null || typeof s.path !== "string" || typeof s.line !== "number" || typeof s.claim !== "string") return [];
     const spelled = s.path.split("\\").join("/");
-    const path = isAbsolute7(spelled) ? relative5(realExistingPath(signalRoot), realExistingPath(spelled)) : posix6.normalize(spelled).replace(/^\.\//, "");
-    if (path === "" || path === "." || path.startsWith("..") || isAbsolute7(path)) return [];
+    const path = isAbsolute8(spelled) ? relative5(realExistingPath(signalRoot), realExistingPath(spelled)) : posix6.normalize(spelled).replace(/^\.\//, "");
+    if (path === "" || path === "." || path.startsWith("..") || isAbsolute8(path)) return [];
     return [
       {
         kind: typeof s.kind === "string" ? s.kind : "",
@@ -34188,7 +34548,7 @@ ${topLevelHelp()}`);
         stopReview: review2.stop,
         prepareClone: gitPrepareClone(),
         now: () => /* @__PURE__ */ new Date(),
-        sleep: (ms) => new Promise((resolve16) => setTimeout(resolve16, ms)),
+        sleep: (ms) => new Promise((resolve17) => setTimeout(resolve17, ms)),
         out: (text5) => console.log(text5),
         err: (text5) => console.error(text5)
       });
@@ -34301,9 +34661,23 @@ async function runInProcess(argv, options = {}) {
   return { code: code3, stdout: out.join(""), stderr: err.join("") };
 }
 async function reviewCommand(argv) {
-  const pullNumber = Number(flag(argv, "--pr"));
-  if (!Number.isInteger(pullNumber) || pullNumber < 1) {
-    console.error("--pr needs a pull request number.");
+  const base = flag(argv, "--base");
+  if (argv.includes("--base") && (base === null || base.startsWith("-"))) {
+    console.error("--base needs a git ref, for example: --base origin/main");
+    return 2;
+  }
+  if (base !== null && argv.includes("--pr")) {
+    console.error("Pass --pr <n> or --base <ref>, not both.");
+    return 2;
+  }
+  const pullOnly = ["--post", "--since", "--full", "--no-recheck-thread"].find((name) => argv.includes(name));
+  if (base !== null && pullOnly !== void 0) {
+    console.error(`${pullOnly} applies to a pull request review; --base reviews a local branch.`);
+    return 2;
+  }
+  const pullNumber = base === null ? Number(flag(argv, "--pr")) : null;
+  if (pullNumber !== null && (!Number.isInteger(pullNumber) || pullNumber < 1)) {
+    console.error("--pr needs a pull request number, or --base <ref> to review a local branch.");
     return 2;
   }
   const modeFlag = flag(argv, "--mode");
@@ -34333,6 +34707,7 @@ async function reviewCommand(argv) {
     {
       repository,
       pullNumber,
+      base,
       mode,
       post: argv.includes("--post"),
       out: flag(argv, "--out"),
