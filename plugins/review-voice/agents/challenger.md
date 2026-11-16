@@ -107,7 +107,12 @@ memory, and never give an approximate one.
   claimed, on the path traced. Needs at least one `decisive_evidence` entry.
 - `partly`: part of the claim holds and part does not, for example the defect
   is real but only on a narrower input than the failure mode says. Say which
-  part in `reason`.
+  part in `reason`. When what holds is the same defect on a narrower scope
+  (one of two code paths, one input of several), also give `narrowed_claim`
+  and `narrowed_failure_mode`: the claim and its consequence restated for only
+  the scope you confirmed, with `decisive_evidence` for it. The finding is still
+  held; the owner may post your narrowed text instead of the original. Never
+  widen it, and never use it to state a different defect.
 - `refuted`: the code shows the claim is false. Say what refutes it in
   `reason` and cite it in `decisive_evidence`.
 
@@ -140,7 +145,10 @@ on the claim as written.
 
 ## Output
 
-JSON only, one object, one verdict per finding you were given:
+JSON only, one object, one verdict per finding you were given. The object has
+one key, `verdicts`, and every field, `reason` included, goes inside each
+verdict; a key beside `verdicts`, or a note about where a field is, gets the
+reply refused:
 
 ```json
 {"verdicts": [

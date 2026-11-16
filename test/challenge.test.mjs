@@ -246,7 +246,7 @@ test('confirmed verdicts with the line confirmed keep every finding eligible', (
     const out = JSON.parse(r.stdout);
     assert.deepEqual(out.eligible.map((e) => e.candidateId), ['cand_001', 'cand_002', 'cand_003']);
     assert.deepEqual(out.challengeHeld, []);
-    assert.deepEqual(out.challenge, { confirmed: ['cand_001', 'cand_002', 'cand_003'], held: [], moved: [], answered: [] });
+    assert.deepEqual(out.challenge, { confirmed: ['cand_001', 'cand_002', 'cand_003'], held: [], moved: [], answered: [], narrowed: [] });
     assert.equal(out.scores.find((s) => s.candidateId === 'cand_001').challenge.verdict, 'confirmed');
   });
 });
@@ -563,5 +563,72 @@ test('#392: a question confirmed with answered: true is stated at minor, above a
     const silent = apply([confirmed('cand_001'), confirmed('cand_002', { answered: true }), confirmed('cand_003')]);
     assert.equal(silent.code, 2);
     assert.match(silent.stderr, /answered gives no reason/);
+  });
+});
+
+// #418: a partly verdict that only narrows the scope held the whole finding,
+// with no route to post the narrowed claim.
+
+test('#418: a narrowed partly verdict is held with its narrowed claim, and posted only on --post-narrowed', () => {
+  withFiles(({ apply }) => {
+    const narrowed = {
+      candidate_id: 'cand_001',
+      verdict: 'partly',
+      line_ok: true,
+      decisive_evidence: ['src/a.ts:3'],
+      narrowed_claim: 'The cache key omits the tenant on the read path.',
+      narrowed_failure_mode: 'A read can return another tenant\'s entry.',
+      reason: 'The write path keys by tenant; only the read path does not.',
+    };
+    const held = JSON.parse(apply([narrowed, confirmed('cand_002'), confirmed('cand_003')]).stdout);
+    assert.deepEqual(held.eligible.map((e) => e.candidate_id), ['cand_002', 'cand_003']);
+    assert.match(held.challengeHeld[0].reason, /Narrowed claim: "The cache key omits the tenant on the read path\." \(post it with challenge --post-narrowed cand_001\)/);
+
+    const r = apply([narrowed, confirmed('cand_002'), confirmed('cand_003')], ['--post-narrowed', 'cand_001']);
+    assert.equal(r.code, 0, r.stderr);
+    const posted = JSON.parse(r.stdout);
+    const entry = posted.eligible.find((e) => e.candidate_id === 'cand_001');
+    assert.equal(entry.claim, narrowed.narrowed_claim);
+    assert.equal(entry.failureMode, narrowed.narrowed_failure_mode);
+    assert.equal(entry.severity, 'important', 'narrowing never changes the tier');
+    assert.equal(entry.narrowedByChallenge.claim, CLAIMS.cand_001);
+    assert.deepEqual(posted.challenge.narrowed, ['cand_001']);
+    assert.deepEqual(posted.challengeHeld, []);
+  });
+});
+
+test('#418: --post-narrowed needs a narrowed partly verdict, and a narrowing is checked', () => {
+  withFiles(({ apply }) => {
+    const plain = apply([confirmed('cand_001'), confirmed('cand_002'), confirmed('cand_003')], ['--post-narrowed', 'cand_001']);
+    assert.equal(plain.code, 2);
+    assert.match(plain.stderr, /--post-narrowed cand_001: its challenger gave no narrowed claim/);
+    const lopsided = apply([{ ...confirmed('cand_001'), narrowed_claim: 'x' }, confirmed('cand_002'), confirmed('cand_003')]);
+    assert.equal(lopsided.code, 2);
+    assert.match(lopsided.stderr, /narrowed_claim and narrowed_failure_mode go together, on partly only/);
+  });
+});
+
+// #421: a challenger put reason beside "verdicts", and the refusal did not say where it was.
+
+test('#421: a field outside the verdict object is named, with the shape wanted', () => {
+  withFiles(({ run, files }) => {
+    const reply = {
+      verdicts: [
+        { candidate_id: 'cand_001', verdict: 'partly', line_ok: true, decisive_evidence: ['src/a.ts:3'] },
+        confirmed('cand_002'),
+        confirmed('cand_003'),
+      ],
+      _note: 'reason follows',
+      reason: 'Only the read path omits the tenant.',
+    };
+    const r = run(['challenge', '--scores', files.scores, '--candidates', files.candidates, '--diff-file', files.patch], JSON.stringify(reply));
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /cand_001: reason must be a string/);
+    assert.match(r.stderr, /reason is outside the verdict object, beside "verdicts"; the reply has "_note", "reason" at the top level/);
+    assert.match(r.stderr, /Every field goes inside each verdict/);
+    // Saved as one of several replies, the stray keys are still named.
+    const several = `${JSON.stringify(reply)}\n\nAnd that is all.`;
+    const r2 = run(['challenge', '--scores', files.scores, '--candidates', files.candidates, '--diff-file', files.patch], several);
+    assert.match(r2.stderr, /reason is outside the verdict object/);
   });
 });
