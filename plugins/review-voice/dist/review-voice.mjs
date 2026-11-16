@@ -22467,7 +22467,9 @@ function challengePrompt(finding, candidate, statements, diffFile, reproduction,
   rows.push(
     "",
     "You are not given the verifier's reasoning, confidence or evidence. Read the code at the head yourself.",
-    `Return {"verdicts": [{"candidate_id": "${id}", "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "decisive_quotes", "reason"}]}.`
+    `Return {"verdicts": [{"candidate_id": "${id}", "verdict", "line_ok", "corrected_line"?, "decisive_evidence", "decisive_quotes", "reason"}]}.`,
+    // A challenger put `reason` beside "verdicts"; the shape is restated where it answers (#421, #427).
+    'Every field, reason included, goes inside the verdict object; the reply has no key but "verdicts".'
   );
   return rows.join("\n");
 }
@@ -33044,10 +33046,11 @@ function applyOwnerSeverityOverride(breakdown, override, ceiling) {
   if (SEVERITY_ORDER[override] === SEVERITY_ORDER[current] || raises && !raiseAllowed) {
     return `--severity ${breakdown.candidateId}=${override} must lower the scored ${current} tier; owner overrides cannot restate a severity, and raise one only as far as its legacy-tier hint names` + (ceiling === null ? " (it names none)." : ` (${ceiling}).`);
   }
+  const derived = breakdown.severity.reason.replace(/; reach is unknown, so the requested \S+ was not applied\. If it breaks.*$/s, "");
   breakdown.severity = {
     ...breakdown.severity,
     severity: override,
-    reason: `${breakdown.severity.reason}, ${raises ? "raised" : "held"} at ${override} by an explicit owner override`
+    reason: `${derived}, ${raises ? "raised" : "held"} at ${override} by an explicit owner override`
   };
   const hint = DOCUMENT_NIT_HINT.replace("<id>", breakdown.candidateId);
   if (override === "nit" && breakdown.rejectedBecause?.endsWith(hint) && !breakdown.rejectedBecause.includes(" Also: ")) {
